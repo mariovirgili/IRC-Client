@@ -52,12 +52,15 @@ static constexpr uint32_t PONG_TIMEOUT_MS = 25000;
 static constexpr uint32_t UI_REFRESH_MS = 50;
 static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
 static constexpr uint32_t TEXT_SCROLL_STEP_MS = 220;
+static constexpr uint32_t BATTERY_POLL_MS = 5000;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
 static constexpr const char* DEFAULT_WIFI_SSID = "YOUR_WIFI";
 static constexpr const char* APP_NAME = "Cardputer IRC";
-static constexpr const char* APP_VERSION = "0.1";
+static constexpr const char* APP_VERSION = "0.2";
+static constexpr uint16_t DEFAULT_SCREEN_TIMEOUT_SEC = 10;
+static constexpr uint8_t DEFAULT_SCREEN_BRIGHTNESS = 10;
 
 extern const uint8_t title_boot_jpg_start[] asm("_binary_media_title_boot_jpg_start");
 extern const uint8_t title_boot_jpg_end[] asm("_binary_media_title_boot_jpg_end");
@@ -109,6 +112,8 @@ enum ConfigFieldId {
   CFG_COLOR_MODE,
   CFG_PERSIST_TABS,
   CFG_SHOW_CONTROL_GLYPHS,
+  CFG_SCREEN_TIMEOUT,
+  CFG_SCREEN_BRIGHTNESS,
   CFG_LOG_ROOT,
   CFG_SAVE_AND_RECONNECT,
   CFG_EXIT_DISCARD,
@@ -175,6 +180,8 @@ struct Config {
   ColorMode colorMode = ColorMode::Full;
   bool showControlGlyphs = true;
   bool persistTabs = true;
+  uint16_t screenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC;
+  uint8_t screenBrightness = DEFAULT_SCREEN_BRIGHTNESS;
 
   String logRoot = "/IRC";
 };
@@ -494,6 +501,9 @@ class IrcClientApp {
 
     initSD();
     loadConfig();
+    applyConfiguredDisplaySettings();
+    refreshBatteryStatus(true);
+    _lastUserActivityMs = millis();
     ensureStatusTab();
     loadState();
     logStatus(String(APP_NAME) + " v" + APP_VERSION + " starting...");
@@ -515,6 +525,8 @@ class IrcClientApp {
     serviceIRC();
     serviceStateSave();
     serviceTextScroll();
+    refreshBatteryStatus();
+    serviceDisplayTimeout();
     if (millis() - _lastUiRefresh >= UI_REFRESH_MS) {
       draw();
       _lastUiRefresh = millis();
@@ -545,6 +557,11 @@ class IrcClientApp {
   uint32_t _nextIrcReconnectAt = 0;
   uint32_t _currentReconnectDelayMs = 3000;
   bool _previousTransportState = false;
+  uint32_t _lastBatteryPollMs = 0;
+  int32_t _batteryLevel = -1;
+  m5::Power_Class::is_charging_t _batteryChargeState = m5::Power_Class::charge_unknown;
+  uint32_t _lastUserActivityMs = 0;
+  bool _screenSleeping = false;
 
   bool _capNegotiationDone = false;
   bool _capRequestSent = false;
@@ -571,6 +588,7 @@ class IrcClientApp {
   uint32_t _lastConfigButtonMs = 0;
   uint32_t _configButtonDownAt = 0;
   bool _configButtonLongHandled = false;
+  bool _discardConfigButtonUntilRelease = false;
 
   bool _channelListOpen = false;
   bool _channelListLoading = false;
@@ -650,6 +668,18 @@ class IrcClientApp {
     return v ? "on" : "off";
   }
 
+  static uint16_t clampScreenTimeoutSeconds(long value) {
+    return static_cast<uint16_t>(std::min<long>(3600, std::max<long>(0, value)));
+  }
+
+  static uint8_t clampScreenBrightnessLevel(long value) {
+    return static_cast<uint8_t>(std::min<long>(10, std::max<long>(0, value)));
+  }
+
+  static uint8_t screenBrightnessToPwm(uint8_t level) {
+    return static_cast<uint8_t>((static_cast<uint16_t>(level) * 255 + 5) / 10);
+  }
+
   static String ellipsize(String s, int maxChars) {
     if (maxChars <= 0) return "";
     if (static_cast<int>(s.length()) <= maxChars) return s;
@@ -664,6 +694,49 @@ class IrcClientApp {
     for (size_t i = 0; i < n; ++i) out += '*';
     if (s.length() > n) out += '+';
     return out;
+  }
+
+  void refreshBatteryStatus(bool force = false) {
+    uint32_t now = millis();
+    if (!force && now - _lastBatteryPollMs < BATTERY_POLL_MS) return;
+    _lastBatteryPollMs = now;
+
+    int32_t level = M5Cardputer.Power.getBatteryLevel();
+    auto chargeState = M5Cardputer.Power.isCharging();
+    if (level != _batteryLevel || chargeState != _batteryChargeState) {
+      _batteryLevel = level;
+      _batteryChargeState = chargeState;
+      _dirty = true;
+    }
+  }
+
+  void applyConfiguredDisplaySettings() {
+    M5Cardputer.Display.setBrightness(screenBrightnessToPwm(_cfg.screenBrightness));
+    if (_screenSleeping) {
+      M5Cardputer.Display.sleep();
+    } else if (_cfg.screenTimeoutSec == 0) {
+      M5Cardputer.Display.wakeup();
+    }
+  }
+
+  void wakeDisplay() {
+    if (!_screenSleeping) return;
+    _screenSleeping = false;
+    M5Cardputer.Display.wakeup();
+    _dirty = true;
+  }
+
+  void recordUserActivity() {
+    _lastUserActivityMs = millis();
+    wakeDisplay();
+  }
+
+  void serviceDisplayTimeout() {
+    if (_screenSleeping) return;
+    if (_cfg.screenTimeoutSec == 0) return;
+    if (millis() - _lastUserActivityMs < static_cast<uint32_t>(_cfg.screenTimeoutSec) * 1000UL) return;
+    M5Cardputer.Display.sleep();
+    _screenSleeping = true;
   }
 
   static String currentDateStamp() {
@@ -932,7 +1005,7 @@ class IrcClientApp {
   }
 
   void serviceTextScroll() {
-    if (_configOpen || _channelListOpen || _tabs.empty()) return;
+    if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -1037,7 +1110,21 @@ class IrcClientApp {
     bool pressed = digitalRead(CONFIG_BUTTON_PIN) == LOW;
     uint32_t now = millis();
 
+    if (_discardConfigButtonUntilRelease) {
+      if (!pressed) _discardConfigButtonUntilRelease = false;
+      _configButtonPrev = pressed;
+      return;
+    }
+
     if (pressed && !_configButtonPrev && now - _lastConfigButtonMs > CONFIG_BUTTON_SHORT_DEBOUNCE_MS) {
+      if (_screenSleeping) {
+        recordUserActivity();
+        _discardConfigButtonUntilRelease = true;
+        _configButtonPrev = pressed;
+        _lastConfigButtonMs = now;
+        return;
+      }
+      recordUserActivity();
       _configButtonDownAt = now;
       _configButtonLongHandled = false;
     }
@@ -1051,6 +1138,7 @@ class IrcClientApp {
     }
 
     if (!pressed && _configButtonPrev) {
+      recordUserActivity();
       if (!_configButtonLongHandled && now - _lastConfigButtonMs > CONFIG_BUTTON_SHORT_DEBOUNCE_MS) {
         if (!_configOpen && !_channelListOpen) {
           _cfg.nickPaneEnabled = !_cfg.nickPaneEnabled;
@@ -1208,6 +1296,8 @@ class IrcClientApp {
       case CFG_BNC_PASS:
       case CFG_SASL_USER:
       case CFG_SASL_PASS:
+      case CFG_SCREEN_TIMEOUT:
+      case CFG_SCREEN_BRIGHTNESS:
       case CFG_LOG_ROOT:
         return true;
       case CFG_IRC_SERVER:
@@ -1247,6 +1337,8 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return "color_mode";
       case CFG_PERSIST_TABS: return "persist_tabs";
       case CFG_SHOW_CONTROL_GLYPHS: return "ctrl_glyphs";
+      case CFG_SCREEN_TIMEOUT: return "screen_timeout_sec";
+      case CFG_SCREEN_BRIGHTNESS: return "screen_brightness";
       case CFG_LOG_ROOT: return "log_root";
       case CFG_SAVE_AND_RECONNECT: return "Save+Reconnect";
       case CFG_EXIT_DISCARD: return "Exit/Discard";
@@ -1284,6 +1376,8 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return colorModeToString(_editCfg.colorMode);
       case CFG_PERSIST_TABS: return boolToOnOff(_editCfg.persistTabs);
       case CFG_SHOW_CONTROL_GLYPHS: return boolToOnOff(_editCfg.showControlGlyphs);
+      case CFG_SCREEN_TIMEOUT: return String(_editCfg.screenTimeoutSec);
+      case CFG_SCREEN_BRIGHTNESS: return String(_editCfg.screenBrightness);
       case CFG_LOG_ROOT: return _editCfg.logRoot;
       case CFG_SAVE_AND_RECONNECT: return "[enter]";
       case CFG_EXIT_DISCARD: return "[enter]";
@@ -1317,6 +1411,8 @@ class IrcClientApp {
       case CFG_BNC_PASS: _editCfg.bncPass = value; break;
       case CFG_SASL_USER: _editCfg.saslUser = value; break;
       case CFG_SASL_PASS: _editCfg.saslPass = value; break;
+      case CFG_SCREEN_TIMEOUT: _editCfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt()); break;
+      case CFG_SCREEN_BRIGHTNESS: _editCfg.screenBrightness = clampScreenBrightnessLevel(value.toInt()); break;
       case CFG_LOG_ROOT: _editCfg.logRoot = value; break;
       default: break;
     }
@@ -1372,6 +1468,8 @@ class IrcClientApp {
     f.println("color_mode=" + colorModeToString(cfg.colorMode));
     f.println("show_control_glyphs=" + String(cfg.showControlGlyphs ? "true" : "false"));
     f.println("persist_tabs=" + String(cfg.persistTabs ? "true" : "false"));
+    f.println("screen_timeout_sec=" + String(cfg.screenTimeoutSec));
+    f.println("screen_brightness=" + String(cfg.screenBrightness));
     f.close();
   }
 
@@ -1421,6 +1519,9 @@ class IrcClientApp {
         _cfg = _editCfg;
         _selfNick = _cfg.nick;
         _currentReconnectDelayMs = _cfg.reconnectInitialMs;
+        applyConfiguredDisplaySettings();
+        if (_cfg.screenTimeoutSec == 0) wakeDisplay();
+        _lastUserActivityMs = millis();
         WiFi.disconnect();
         _wifiReady = false;
         _nextWifiAttemptAt = 0;
@@ -1446,6 +1547,7 @@ class IrcClientApp {
   void handleConfigKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
+    recordUserActivity();
 
     auto ks = M5Cardputer.Keyboard.keysState();
 
@@ -1547,6 +1649,8 @@ class IrcClientApp {
       else if (key == "color_mode") _cfg.colorMode = parseColorMode(value);
       else if (key == "show_control_glyphs") _cfg.showControlGlyphs = strToBool(value);
       else if (key == "persist_tabs") _cfg.persistTabs = strToBool(value);
+      else if (key == "screen_timeout_sec") _cfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt());
+      else if (key == "screen_brightness") _cfg.screenBrightness = clampScreenBrightnessLevel(value.toInt());
     }
 
     f.close();
@@ -2657,13 +2761,46 @@ class IrcClientApp {
     }
   }
 
+  void applyKeyboardScroll(Tab& tab, int delta) {
+    tab.scroll = std::max(0, tab.scroll + delta);
+    _dirty = true;
+  }
+
+  bool handleFnScrollShortcut(char c) {
+    if (_tabs.empty()) return false;
+
+    Tab& tab = _tabs[_activeTab];
+    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+
+    switch (c) {
+      case ';':
+        applyKeyboardScroll(tab, 1);
+        return true;
+      case '.':
+        applyKeyboardScroll(tab, -1);
+        return true;
+      case ',':
+        applyKeyboardScroll(tab, page);
+        return true;
+      case '/':
+        applyKeyboardScroll(tab, -page);
+        return true;
+      default:
+        return false;
+    }
+  }
+
   void handleKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
+    recordUserActivity();
 
     auto ks = M5Cardputer.Keyboard.keysState();
 
     for (char c : ks.word) {
+      if (ks.fn && handleFnScrollShortcut(c)) {
+        continue;
+      }
       if (c == '`') {
         openChannelListPage(true);
         continue;
@@ -2691,6 +2828,7 @@ class IrcClientApp {
   void handleChannelListKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
+    recordUserActivity();
 
     auto ks = M5Cardputer.Keyboard.keysState();
 
@@ -3043,7 +3181,7 @@ class IrcClientApp {
   }
 
   void draw() {
-    if (!_dirty) return;
+    if (_screenSleeping || !_dirty) return;
     _dirty = false;
     auto& gfx = drawTarget();
     gfx.fillScreen(UI_BG);
@@ -3068,6 +3206,7 @@ class IrcClientApp {
     String rhs = "hold G0";
     gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
     gfx.print(rhs);
+    drawBatteryIndicator(gfx, UI_HEADER);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -3144,6 +3283,7 @@ class IrcClientApp {
     String rhs = "` close";
     gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
     gfx.print(rhs);
+    drawBatteryIndicator(gfx, UI_HEADER);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -3207,20 +3347,65 @@ class IrcClientApp {
     String title = _tabs[_activeTab].name;
     if (_tabs[_activeTab].mention) title = "!" + title;
     else if (_tabs[_activeTab].unread) title = "*" + title;
-    if (title.length() > 15) title = title.substring(0, 15);
 
     String net = _wifiReady ? WiFi.localIP().toString() : "offline";
     if (_transport.connected()) net += " IRC";
     if (!_ircRegistered && _transport.connected()) net += "*";
-    if (net.length() > 13) net = net.substring(0, 13);
+
+    static constexpr int batteryBodyW = 18;
+    static constexpr int batteryTipW = 2;
+    static constexpr int batteryGapW = 1;
+    static constexpr int batteryTotalW = batteryBodyW + batteryTipW + batteryGapW;
+    int batteryX = (SCREEN_W - batteryTotalW) / 2;
+    int leftChars = std::max(0, (batteryX - 4) / CHAR_W);
+    int rightChars = std::max(0, (SCREEN_W - (batteryX + batteryTotalW) - 4) / CHAR_W);
+    title = ellipsize(title, leftChars);
+    net = ellipsize(net, rightChars);
 
     gfx.setCursor(2, 3);
     gfx.print(title);
 
     int rx = SCREEN_W - (net.length() * CHAR_W) - 2;
-    if (rx < 110) rx = 110;
+    int minRx = batteryX + batteryTotalW + 4;
+    if (rx < minRx) rx = minRx;
     gfx.setCursor(rx, 3);
     gfx.print(net);
+    drawBatteryIndicator(gfx, UI_HEADER);
+  }
+
+  void drawBatteryIndicator(lgfx::LovyanGFX& gfx, uint16_t bg) {
+    static constexpr int bodyW = 18;
+    static constexpr int bodyH = 8;
+    static constexpr int tipW = 2;
+    static constexpr int tipH = 4;
+    static constexpr int gapW = 1;
+
+    int x = (SCREEN_W - (bodyW + tipW + gapW)) / 2;
+    int y = 3;
+
+    gfx.fillRect(x - 1, y - 1, bodyW + tipW + gapW + 2, bodyH + 2, bg);
+    gfx.drawRect(x, y, bodyW, bodyH, UI_FG);
+    gfx.fillRect(x + bodyW + gapW, y + ((bodyH - tipH) / 2), tipW, tipH, UI_FG);
+    gfx.fillRect(x + 1, y + 1, bodyW - 2, bodyH - 2, bg);
+
+    if (_batteryLevel < 0) {
+      gfx.drawFastHLine(x + 4, y + (bodyH / 2), bodyW - 8, UI_DIM);
+      return;
+    }
+
+    int clampedLevel = std::max(0, std::min(100, static_cast<int>(_batteryLevel)));
+    int innerW = bodyW - 4;
+    int fillW = (innerW * clampedLevel + 99) / 100;
+    uint16_t fillColor = clampedLevel <= 20 ? UI_WARN : UI_ACCENT;
+    if (fillW > 0) {
+      gfx.fillRect(x + 2, y + 2, fillW, bodyH - 4, fillColor);
+    }
+
+    if (_batteryChargeState == m5::Power_Class::is_charging) {
+      gfx.drawLine(x + 8, y + 1, x + 6, y + 4, UI_FG);
+      gfx.drawLine(x + 6, y + 4, x + 9, y + 4, UI_FG);
+      gfx.drawLine(x + 9, y + 4, x + 7, y + 7, UI_FG);
+    }
   }
 
   int bodyTextWidth() const {

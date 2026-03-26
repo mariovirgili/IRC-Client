@@ -2,6 +2,16 @@
 
 This project targets the M5Stack Cardputer and implements a compact IRC client with:
 
+Current release: `v0.2`
+
+## New in v0.2
+
+- Graphical battery indicator centered in the top bar
+- Screen timeout after inactivity with automatic wake on input
+- Configurable screen timeout directly from the on-device config menu
+- Configurable screen brightness from `0` to `10` in the config menu
+- Chat scroll shortcuts with `Fn + ; . , /` to read older messages while new ones arrive
+
 - RFC-style IRC registration flow (`PASS`, `NICK`, `USER`)
 - Direct TLS support with `WiFiClientSecure`
 - Built-in IRC network presets with persistent selection
@@ -19,6 +29,9 @@ This project targets the M5Stack Cardputer and implements a compact IRC client w
 - Per-tab scrollback
 - Highlight detection when your nick is mentioned
 - Two-row input area for long input buffers
+- Centered graphical battery indicator in the header
+- Idle screen timeout with automatic wake on activity
+- Configurable screen brightness from `0` to `10`
 - Persistent tab/session restore on SD
 - Per-tab daily logs on SD
 - IRC formatting support on screen:
@@ -87,6 +100,8 @@ nick_pane_enabled=true
 color_mode=full
 show_control_glyphs=true
 persist_tabs=true
+screen_timeout_sec=10
+screen_brightness=10
 reconnect_initial_ms=3000
 reconnect_max_ms=60000
 
@@ -159,6 +174,7 @@ Typing plain text sends a `PRIVMSG` to the active channel or query tab.
 
 - Press `` ` `` to open the server channel list and press it again to close it.
 - In config and channel-list pages, use `;` for up and `.` for down.
+- In chat tabs, hold `Fn` and use `;` / `.` for line-by-line scroll and `,` / `/` for page scroll.
 - Press `Enter` on a channel-list item to join it immediately.
 
 ## Logging
@@ -183,6 +199,8 @@ The log timestamp uses IRCv3 `server-time` when the server provides it, otherwis
 - SASL is implemented for the `PLAIN` mechanism only.
 - The two-row input area improves local editing of long lines, but outbound messages are still sent as standard single-line IRC messages.
 - The color filter only affects on-screen rendering; the log file always stores plain text without IRC formatting bytes.
+- `screen_timeout_sec=0` disables automatic screen sleep.
+- `screen_brightness` accepts values from `0` (off) to `10` (max).
 
 
 ## Config page controls
