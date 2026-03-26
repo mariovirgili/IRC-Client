@@ -60,7 +60,13 @@ jobs:
           cp "$BUILD_DIR/firmware.bin" "$DIST_DIR/firmware.bin"
           cp "$BUILD_DIR/bootloader.bin" "$DIST_DIR/bootloader.bin"
           cp "$BUILD_DIR/partitions.bin" "$DIST_DIR/partitions.bin"
-          cp "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" "$DIST_DIR/boot_app0.bin"
+
+          BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          if [[ ! -f "$BOOT_APP0" ]]; then
+            echo "boot_app0.bin not found at expected path: $BOOT_APP0" >&2
+            exit 1
+          fi
+          cp "$BOOT_APP0" "$DIST_DIR/boot_app0.bin"
 
       - name: Build merged firmware variants
         run: |
@@ -68,34 +74,16 @@ jobs:
           DIST_DIR="dist"
 
           # Variant 1: exact board defaults for m5stack-stamps3 (QIO / 80MHz / 8MB)
-          python -m esptool \
-            --chip "$ESP_CHIP" merge-bin \
-            -o "$DIST_DIR/cardputer-merged-qio.bin" \
-            --flash-mode qio \
-            --flash-freq "$FLASH_FREQ" \
-            --flash-size "$FLASH_SIZE" \
-            0x1000 "$DIST_DIR/bootloader.bin" \
-            0x8000 "$DIST_DIR/partitions.bin" \
-            0xe000 "$DIST_DIR/boot_app0.bin" \
-            0x10000 "$DIST_DIR/firmware.bin"
+          python -m esptool             --chip "$ESP_CHIP" merge-bin             -o "$DIST_DIR/cardputer-merged-qio.bin"             --flash-mode qio             --flash-freq "$FLASH_FREQ"             --flash-size "$FLASH_SIZE"             0x1000 "$DIST_DIR/bootloader.bin"             0x8000 "$DIST_DIR/partitions.bin"             0xe000 "$DIST_DIR/boot_app0.bin"             0x10000 "$DIST_DIR/firmware.bin"
 
           # Variant 2: conservative standalone merged image for launchers / web-style installers
-          python -m esptool \
-            --chip "$ESP_CHIP" merge-bin \
-            -o "$DIST_DIR/cardputer-merged-dio.bin" \
-            --flash-mode dio \
-            --flash-freq "$FLASH_FREQ" \
-            --flash-size "$FLASH_SIZE" \
-            0x1000 "$DIST_DIR/bootloader.bin" \
-            0x8000 "$DIST_DIR/partitions.bin" \
-            0xe000 "$DIST_DIR/boot_app0.bin" \
-            0x10000 "$DIST_DIR/firmware.bin"
+          python -m esptool             --chip "$ESP_CHIP" merge-bin             -o "$DIST_DIR/cardputer-merged-dio.bin"             --flash-mode dio             --flash-freq "$FLASH_FREQ"             --flash-size "$FLASH_SIZE"             0x1000 "$DIST_DIR/bootloader.bin"             0x8000 "$DIST_DIR/partitions.bin"             0xe000 "$DIST_DIR/boot_app0.bin"             0x10000 "$DIST_DIR/firmware.bin"
 
-      - name: Inspect merged images
+      - name: Inspect actual ESP images
         run: |
           set -euo pipefail
-          python -m esptool --chip "$ESP_CHIP" image-info dist/cardputer-merged-qio.bin | tee dist/image-info-qio.txt
-          python -m esptool --chip "$ESP_CHIP" image-info dist/cardputer-merged-dio.bin | tee dist/image-info-dio.txt
+          python -m esptool --chip "$ESP_CHIP" image-info dist/bootloader.bin | tee dist/image-info-bootloader.txt
+          python -m esptool --chip "$ESP_CHIP" image-info dist/firmware.bin | tee dist/image-info-firmware.txt
 
       - name: Write flashing instructions
         run: |
@@ -117,6 +105,7 @@ jobs:
           Notes:
           - Both merged files are full-flash images and must be flashed at offset 0x0.
           - The split files are the fallback if a launcher dislikes the merged image.
+          - image-info output is generated for bootloader.bin and firmware.bin, not the merged .bin files.
           EOF
 
       - name: Write checksums
@@ -135,8 +124,8 @@ jobs:
           path: |
             dist/cardputer-merged-qio.bin
             dist/cardputer-merged-dio.bin
-            dist/image-info-qio.txt
-            dist/image-info-dio.txt
+            dist/image-info-bootloader.txt
+            dist/image-info-firmware.txt
             dist/FLASHING.txt
             dist/SHA256SUMS.txt
           retention-days: 7
@@ -150,6 +139,8 @@ jobs:
             dist/bootloader.bin
             dist/partitions.bin
             dist/boot_app0.bin
+            dist/image-info-bootloader.txt
+            dist/image-info-firmware.txt
             dist/FLASHING.txt
             dist/SHA256SUMS.txt
           retention-days: 7
