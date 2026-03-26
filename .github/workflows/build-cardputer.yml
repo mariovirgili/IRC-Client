@@ -107,7 +107,7 @@ jobs:
             dist/launcher/cardputer-launcher.bin
             dist/meta/FLASHING.txt
             dist/meta/firmware-image-info.txt
-          retention-days: 7
+          retention-days: 1
 
       - name: Upload full-flash artifact
         uses: actions/upload-artifact@v4
@@ -118,7 +118,7 @@ jobs:
             dist/meta/FLASHING.txt
             dist/meta/bootloader-image-info.txt
             dist/meta/firmware-image-info.txt
-          retention-days: 7
+          retention-days: 1
 
       - name: Upload split artifact
         uses: actions/upload-artifact@v4
@@ -132,4 +132,4 @@ jobs:
             dist/meta/boot_app0.bin
             dist/meta/bootloader-image-info.txt
             dist/meta/firmware-image-info.txt
-          retention-days: 7
+          retention-days: 1
