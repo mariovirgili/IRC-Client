@@ -45,6 +45,7 @@ Current release: `v0.2`
   - `mono`
 - Visible rendering of ASCII control characters when enabled
 - Exponential reconnect backoff and ping timeout recovery
+- Selectable chat overflow behavior: horizontal marquee scroll or wrapped multi-line rendering
 
 ## Build
 
@@ -99,6 +100,7 @@ sasl_mechanism=PLAIN
 nick_pane_enabled=true
 color_mode=full
 show_control_glyphs=true
+chat_overflow_mode=scroll
 persist_tabs=true
 screen_timeout_sec=10
 screen_brightness=10
@@ -162,6 +164,7 @@ That file is written automatically when tab state or UI preferences change.
 - `/away [reason]`
 - `/list [mask]`
 - `/colormode full|safe|mono`
+- `/chatmode scroll|wrap`
 - `/quote RAW IRC LINE`
 - `/raw RAW IRC LINE`
 - `/config`
@@ -174,7 +177,7 @@ Typing plain text sends a `PRIVMSG` to the active channel or query tab.
 
 - Press `` ` `` to open the server channel list and press it again to close it.
 - In config and channel-list pages, use `;` for up and `.` for down.
-- In chat tabs, hold `Fn` and use `;` / `.` for line-by-line scroll and `,` / `/` for page scroll.
+- In chat tabs, hold `Fn` and use `;` / `.` for line-by-line scroll and `,` / `/` for page scroll. In `wrap` mode these move by visible wrapped rows.
 - Press `Enter` on a channel-list item to join it immediately.
 
 ## Logging
@@ -198,6 +201,7 @@ The log timestamp uses IRCv3 `server-time` when the server provides it, otherwis
 - TLS through proxy is still **not** implemented in this build.
 - SASL is implemented for the `PLAIN` mechanism only.
 - The two-row input area improves local editing of long lines, but outbound messages are still sent as standard single-line IRC messages.
+- `chat_overflow_mode=scroll` preserves the original one-line marquee behavior; `wrap` uses multi-line rendering for long chat messages.
 - The color filter only affects on-screen rendering; the log file always stores plain text without IRC formatting bytes.
 - `screen_timeout_sec=0` disables automatic screen sleep.
 - `screen_brightness` accepts values from `0` (off) to `10` (max).

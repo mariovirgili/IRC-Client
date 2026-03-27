@@ -34,6 +34,7 @@ static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = SCREEN_H - HEADER_H - INPUT_H - 2;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
+static constexpr int BODY_ROW_H = CHAR_H + 2;
 static constexpr int NICK_PANE_W = 76;
 static constexpr int TIMESTAMP_W_CHARS = 6;
 static constexpr int CONFIG_BUTTON_PIN = 0;
@@ -83,6 +84,11 @@ enum class ColorMode {
   Mono
 };
 
+enum class ChatOverflowMode {
+  Scroll,
+  Wrap
+};
+
 enum ConfigFieldId {
   CFG_WIFI_SSID = 0,
   CFG_WIFI_PASS,
@@ -112,6 +118,7 @@ enum ConfigFieldId {
   CFG_COLOR_MODE,
   CFG_PERSIST_TABS,
   CFG_SHOW_CONTROL_GLYPHS,
+  CFG_CHAT_OVERFLOW_MODE,
   CFG_SCREEN_TIMEOUT,
   CFG_SCREEN_BRIGHTNESS,
   CFG_LOG_ROOT,
@@ -179,6 +186,7 @@ struct Config {
 
   ColorMode colorMode = ColorMode::Full;
   bool showControlGlyphs = true;
+  ChatOverflowMode chatOverflowMode = ChatOverflowMode::Scroll;
   bool persistTabs = true;
   uint16_t screenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC;
   uint8_t screenBrightness = DEFAULT_SCREEN_BRIGHTNESS;
@@ -655,6 +663,20 @@ class IrcClientApp {
     return "full";
   }
 
+  static ChatOverflowMode parseChatOverflowMode(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "wrap" || s == "wrapped" || s == "multiline") return ChatOverflowMode::Wrap;
+    return ChatOverflowMode::Scroll;
+  }
+
+  static String chatOverflowModeToString(ChatOverflowMode mode) {
+    switch (mode) {
+      case ChatOverflowMode::Scroll: return "scroll";
+      case ChatOverflowMode::Wrap: return "wrap";
+    }
+    return "scroll";
+  }
+
   static String proxyTypeToString(ProxyType type) {
     switch (type) {
       case ProxyType::None: return "none";
@@ -1005,6 +1027,7 @@ class IrcClientApp {
   }
 
   void serviceTextScroll() {
+    if (_cfg.chatOverflowMode != ChatOverflowMode::Scroll) return;
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (!activeTabNeedsTextScroll()) return;
 
@@ -1015,8 +1038,12 @@ class IrcClientApp {
     }
   }
 
+  int visibleBodyRows() const {
+    return std::max(1, BODY_H / BODY_ROW_H);
+  }
+
   void getVisibleBodyRange(const Tab& tab, int& start, int& end, int& maxLines) const {
-    maxLines = BODY_H / (CHAR_H + 2);
+    maxLines = visibleBodyRows();
     int total = static_cast<int>(tab.lines.size());
     start = std::max(0, total - maxLines - tab.scroll);
     end = std::min(total, start + maxLines);
@@ -1025,6 +1052,43 @@ class IrcClientApp {
 
   int chatTextWidth() const {
     return bodyTextWidth() - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+  }
+
+  int wrappedRowsForLine(const ChatLine& line, int textWidth) const {
+    if (_cfg.chatOverflowMode != ChatOverflowMode::Wrap) return 1;
+    int visibleCols = std::max(1, textWidth / CHAR_W);
+    int totalCols = measureStyledTextColumns(line.raw);
+    return std::max(1, (totalCols + visibleCols - 1) / visibleCols);
+  }
+
+  int totalBodyRows(const Tab& tab, int textWidth) const {
+    int total = 0;
+    for (const ChatLine& line : tab.lines) total += wrappedRowsForLine(line, textWidth);
+    return total;
+  }
+
+  void getWrapViewState(const Tab& tab, int textWidth, int& startLine, int& startRowOffset, int& maxRows) const {
+    maxRows = visibleBodyRows();
+    startLine = 0;
+    startRowOffset = 0;
+    if (tab.lines.empty()) return;
+
+    int totalRows = totalBodyRows(tab, textWidth);
+    int topRow = std::max(0, totalRows - maxRows - tab.scroll);
+
+    int remaining = topRow;
+    for (size_t i = 0; i < tab.lines.size(); ++i) {
+      int rows = wrappedRowsForLine(tab.lines[i], textWidth);
+      if (remaining < rows) {
+        startLine = static_cast<int>(i);
+        startRowOffset = remaining;
+        return;
+      }
+      remaining -= rows;
+    }
+
+    startLine = static_cast<int>(tab.lines.size());
+    startRowOffset = 0;
   }
 
   int measureStyledTextColumns(const String& raw) const {
@@ -1078,6 +1142,7 @@ class IrcClientApp {
   }
 
   bool activeTabNeedsTextScroll() const {
+    if (_cfg.chatOverflowMode != ChatOverflowMode::Scroll) return false;
     if (_activeTab < 0 || _activeTab >= static_cast<int>(_tabs.size())) return false;
 
     const Tab& tab = _tabs[_activeTab];
@@ -1337,6 +1402,7 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return "color_mode";
       case CFG_PERSIST_TABS: return "persist_tabs";
       case CFG_SHOW_CONTROL_GLYPHS: return "ctrl_glyphs";
+      case CFG_CHAT_OVERFLOW_MODE: return "chat_overflow_mode";
       case CFG_SCREEN_TIMEOUT: return "screen_timeout_sec";
       case CFG_SCREEN_BRIGHTNESS: return "screen_brightness";
       case CFG_LOG_ROOT: return "log_root";
@@ -1376,6 +1442,7 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return colorModeToString(_editCfg.colorMode);
       case CFG_PERSIST_TABS: return boolToOnOff(_editCfg.persistTabs);
       case CFG_SHOW_CONTROL_GLYPHS: return boolToOnOff(_editCfg.showControlGlyphs);
+      case CFG_CHAT_OVERFLOW_MODE: return chatOverflowModeToString(_editCfg.chatOverflowMode);
       case CFG_SCREEN_TIMEOUT: return String(_editCfg.screenTimeoutSec);
       case CFG_SCREEN_BRIGHTNESS: return String(_editCfg.screenBrightness);
       case CFG_LOG_ROOT: return _editCfg.logRoot;
@@ -1467,6 +1534,7 @@ class IrcClientApp {
     f.println("log_root=" + cfg.logRoot);
     f.println("color_mode=" + colorModeToString(cfg.colorMode));
     f.println("show_control_glyphs=" + String(cfg.showControlGlyphs ? "true" : "false"));
+    f.println("chat_overflow_mode=" + chatOverflowModeToString(cfg.chatOverflowMode));
     f.println("persist_tabs=" + String(cfg.persistTabs ? "true" : "false"));
     f.println("screen_timeout_sec=" + String(cfg.screenTimeoutSec));
     f.println("screen_brightness=" + String(cfg.screenBrightness));
@@ -1511,6 +1579,10 @@ class IrcClientApp {
         break;
       case CFG_SHOW_CONTROL_GLYPHS:
         _editCfg.showControlGlyphs = !_editCfg.showControlGlyphs;
+        break;
+      case CFG_CHAT_OVERFLOW_MODE:
+        if (_editCfg.chatOverflowMode == ChatOverflowMode::Scroll) _editCfg.chatOverflowMode = ChatOverflowMode::Wrap;
+        else _editCfg.chatOverflowMode = ChatOverflowMode::Scroll;
         break;
       case CFG_SAVE_AND_RECONNECT:
         if (_editCfg.reconnectInitialMs == 0) _editCfg.reconnectInitialMs = 3000;
@@ -1648,6 +1720,7 @@ class IrcClientApp {
       else if (key == "log_root") _cfg.logRoot = value;
       else if (key == "color_mode") _cfg.colorMode = parseColorMode(value);
       else if (key == "show_control_glyphs") _cfg.showControlGlyphs = strToBool(value);
+      else if (key == "chat_overflow_mode") _cfg.chatOverflowMode = parseChatOverflowMode(value);
       else if (key == "persist_tabs") _cfg.persistTabs = strToBool(value);
       else if (key == "screen_timeout_sec") _cfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt());
       else if (key == "screen_brightness") _cfg.screenBrightness = clampScreenBrightnessLevel(value.toInt());
@@ -1694,6 +1767,8 @@ class IrcClientApp {
         _cfg.nickPaneEnabled = strToBool(value);
       } else if (key == "color_mode") {
         _cfg.colorMode = parseColorMode(value);
+      } else if (key == "chat_overflow_mode") {
+        _cfg.chatOverflowMode = parseChatOverflowMode(value);
       }
     }
     f.close();
@@ -1726,6 +1801,7 @@ class IrcClientApp {
     f.println("active=" + _tabs[_activeTab].name);
     f.println("nick_pane_enabled=" + String(_cfg.nickPaneEnabled ? "true" : "false"));
     f.println("color_mode=" + colorModeToString(_cfg.colorMode));
+    f.println("chat_overflow_mode=" + chatOverflowModeToString(_cfg.chatOverflowMode));
     for (size_t i = 1; i < _tabs.size(); ++i) {
       if (_tabs[i].type == TabType::Channel) f.println("channel=" + _tabs[i].name);
       else if (_tabs[i].type == TabType::Query) f.println("query=" + _tabs[i].name);
@@ -2766,11 +2842,22 @@ class IrcClientApp {
     _dirty = true;
   }
 
+  int scrollPageRows() const {
+    return std::max(1, visibleBodyRows() - 1);
+  }
+
+  int scrollTopValue(const Tab& tab) const {
+    if (_cfg.chatOverflowMode == ChatOverflowMode::Wrap) {
+      return totalBodyRows(tab, chatTextWidth());
+    }
+    return static_cast<int>(tab.lines.size());
+  }
+
   bool handleFnScrollShortcut(char c) {
     if (_tabs.empty()) return false;
 
     Tab& tab = _tabs[_activeTab];
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int page = scrollPageRows();
 
     switch (c) {
       case ';':
@@ -2900,12 +2987,12 @@ class IrcClientApp {
     mode.toLowerCase();
     int n = countStr.isEmpty() ? 1 : std::max(1, static_cast<int>(countStr.toInt()));
 
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int page = scrollPageRows();
     if (mode == "up") tab.scroll += n;
     else if (mode == "down") tab.scroll = std::max(0, tab.scroll - n);
     else if (mode == "pageup") tab.scroll += n * page;
     else if (mode == "pagedown") tab.scroll = std::max(0, tab.scroll - (n * page));
-    else if (mode == "top") tab.scroll = static_cast<int>(tab.lines.size());
+    else if (mode == "top") tab.scroll = scrollTopValue(tab);
     else if (mode == "bottom") tab.scroll = 0;
     if (tab.scroll < 0) tab.scroll = 0;
   }
@@ -3119,6 +3206,16 @@ class IrcClientApp {
         _cfg.colorMode = parseColorMode(args);
         appendLine(statusTab(), "*** Color mode = " + colorModeToString(_cfg.colorMode));
         markStateDirty();
+      }
+      return;
+    }
+
+    if (cmd == "chatmode") {
+      if (!args.isEmpty()) {
+        _cfg.chatOverflowMode = parseChatOverflowMode(args);
+        appendLine(statusTab(), "*** Chat mode = " + chatOverflowModeToString(_cfg.chatOverflowMode));
+        markStateDirty();
+        _dirty = true;
       }
       return;
     }
@@ -3421,17 +3518,32 @@ class IrcClientApp {
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
     int paneWidth = showPane ? NICK_PANE_W : 0;
     int textWidth = SCREEN_W - paneWidth - 2;
-    int start = 0;
-    int end = 0;
-    int maxLines = 0;
-    getVisibleBodyRange(tab, start, end, maxLines);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
     int y = BODY_Y + 1;
-    for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
-      drawChatLine(0, y, tab.lines[i], textWidth);
-      y += CHAR_H + 2;
+    if (_cfg.chatOverflowMode == ChatOverflowMode::Wrap) {
+      int startLine = 0;
+      int startRowOffset = 0;
+      int maxRows = 0;
+      getWrapViewState(tab, textWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4, startLine, startRowOffset, maxRows);
+      int rowsRemaining = maxRows;
+      for (int i = startLine; i < static_cast<int>(tab.lines.size()) && rowsRemaining > 0; ++i) {
+        int rowOffset = (i == startLine) ? startRowOffset : 0;
+        int drawnRows = drawChatLineWrapped(0, y, tab.lines[i], textWidth, rowOffset, rowsRemaining);
+        if (drawnRows <= 0) break;
+        y += drawnRows * BODY_ROW_H;
+        rowsRemaining -= drawnRows;
+      }
+    } else {
+      int start = 0;
+      int end = 0;
+      int maxLines = 0;
+      getVisibleBodyRange(tab, start, end, maxLines);
+      for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
+        drawChatLine(0, y, tab.lines[i], textWidth);
+        y += BODY_ROW_H;
+      }
     }
 
     if (showPane) drawNickPane(tab);
@@ -3455,6 +3567,34 @@ class IrcClientApp {
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
     drawStyledText(textX, y, line.raw, textW, lineBg, currentTextScrollOffsetCols(line, textW));
+  }
+
+  int drawChatLineWrapped(int x, int y, const ChatLine& line, int maxWidth, int startRow, int maxRows) {
+    auto& gfx = drawTarget();
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    int totalRows = wrappedRowsForLine(line, textW);
+    int visibleRows = std::max(0, std::min(maxRows, totalRows - startRow));
+    if (visibleRows <= 0) return 0;
+
+    uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
+    for (int row = 0; row < visibleRows; ++row) {
+      int rowY = y + row * BODY_ROW_H;
+      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, lineBg);
+      if (line.highlight) gfx.fillRect(x, rowY, 2, CHAR_H + 1, UI_WARN);
+    }
+
+    if (startRow == 0) {
+      int stampX = x + 2;
+      gfx.setTextColor(UI_DIM, lineBg);
+      gfx.setCursor(stampX, y);
+      String stamp = line.stampShort;
+      if (stamp.length() > 5) stamp = stamp.substring(0, 5);
+      gfx.print(stamp);
+    }
+
+    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
+    drawStyledTextWrapped(textX, y, line.raw, textW, lineBg, startRow, visibleRows);
+    return visibleRows;
   }
 
   void drawNickPane(const Tab& tab) {
@@ -3546,6 +3686,87 @@ class IrcClientApp {
         gfx.print(out);
       }
       cx += CHAR_W;
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+          st.bold = !st.bold;
+          break;
+        case 0x03: {
+          int j = i + 1;
+          String a, b;
+          while (j < raw.length() && a.length() < 2 && isdigit(static_cast<unsigned char>(raw[j]))) a += raw[j++];
+          if (j < raw.length() && raw[j] == ',') {
+            ++j;
+            while (j < raw.length() && b.length() < 2 && isdigit(static_cast<unsigned char>(raw[j]))) b += raw[j++];
+          }
+          if (_cfg.colorMode == ColorMode::Full || _cfg.colorMode == ColorMode::Safe) {
+            if (a.isEmpty()) {
+              st.fg = UI_FG;
+              st.bg = baseBg;
+            } else {
+              st.fg = ircColorTo565(a.toInt());
+              if (_cfg.colorMode == ColorMode::Full && !b.isEmpty()) st.bg = ircColorTo565(b.toInt());
+              if (_cfg.colorMode == ColorMode::Safe) st.bg = baseBg;
+            }
+          } else {
+            st.fg = UI_FG;
+            st.bg = baseBg;
+          }
+          i = j - 1;
+          break;
+        }
+        case 0x0F:
+          st = TextStyle();
+          st.fg = UI_FG;
+          st.bg = baseBg;
+          break;
+        case 0x16:
+          st.reverse = !st.reverse;
+          break;
+        case 0x1D:
+          break;
+        case 0x1F:
+          st.underline = !st.underline;
+          break;
+        default:
+          emitChar(c);
+          break;
+      }
+    }
+  }
+
+  void drawStyledTextWrapped(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int startRow, int maxRows) {
+    auto& gfx = drawTarget();
+    int visibleCols = std::max(1, maxWidth / CHAR_W);
+    TextStyle st;
+    st.fg = UI_FG;
+    st.bg = baseBg;
+    int emittedCols = 0;
+
+    auto emitChar = [&](char out) {
+      int row = emittedCols / visibleCols;
+      int col = emittedCols % visibleCols;
+      if (row >= startRow && row < startRow + maxRows) {
+        int drawX = x + col * CHAR_W;
+        int drawY = y + (row - startRow) * BODY_ROW_H;
+        uint16_t fg = st.reverse ? st.bg : st.fg;
+        uint16_t bg = st.reverse ? st.fg : st.bg;
+        gfx.fillRect(drawX, drawY, CHAR_W, CHAR_H + 1, bg);
+        gfx.setTextColor(fg, bg);
+        gfx.setCursor(drawX, drawY);
+        gfx.print(out);
+        if (st.underline) {
+          gfx.drawFastHLine(drawX, drawY + CHAR_H, CHAR_W, fg);
+        }
+        if (st.bold && drawX + 1 < x + maxWidth) {
+          gfx.setCursor(drawX + 1, drawY);
+          gfx.print(out);
+        }
+      }
+      ++emittedCols;
     };
 
     for (size_t i = 0; i < raw.length(); ++i) {
