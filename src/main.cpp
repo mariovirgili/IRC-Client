@@ -34,6 +34,7 @@ static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = SCREEN_H - HEADER_H - INPUT_H - 2;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
+static constexpr int ROW_H = CHAR_H + 2;
 static constexpr int NICK_PANE_W = 76;
 static constexpr int TIMESTAMP_W_CHARS = 6;
 static constexpr int CONFIG_BUTTON_PIN = 0;
@@ -83,6 +84,16 @@ enum class ColorMode {
   Mono
 };
 
+enum class TextOverflowMode {
+  Marquee,
+  Wrap
+};
+
+enum class BouncerMode {
+  Generic,
+  Soju
+};
+
 enum ConfigFieldId {
   CFG_WIFI_SSID = 0,
   CFG_WIFI_PASS,
@@ -102,8 +113,11 @@ enum ConfigFieldId {
   CFG_PROXY_USER,
   CFG_PROXY_PASS,
   CFG_BNC_ENABLED,
+  CFG_BNC_MODE,
   CFG_BNC_USER,
   CFG_BNC_NETWORK,
+  CFG_BNC_CLIENT,
+  CFG_SOJU_BIND_NETID,
   CFG_BNC_PASS,
   CFG_SASL_ENABLED,
   CFG_SASL_USER,
@@ -112,6 +126,7 @@ enum ConfigFieldId {
   CFG_COLOR_MODE,
   CFG_PERSIST_TABS,
   CFG_SHOW_CONTROL_GLYPHS,
+  CFG_TEXT_OVERFLOW,
   CFG_SCREEN_TIMEOUT,
   CFG_SCREEN_BRIGHTNESS,
   CFG_LOG_ROOT,
@@ -164,8 +179,11 @@ struct Config {
   String proxyPass;
 
   bool bncEnabled = false;
+  BouncerMode bncMode = BouncerMode::Generic;
   String bncUser;
   String bncNetwork;
+  String bncClient;
+  String sojuBindNetId;
   String bncPass;
 
   bool saslEnabled = false;
@@ -180,6 +198,7 @@ struct Config {
   ColorMode colorMode = ColorMode::Full;
   bool showControlGlyphs = true;
   bool persistTabs = true;
+  TextOverflowMode textOverflowMode = TextOverflowMode::Marquee;
   uint16_t screenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC;
   uint8_t screenBrightness = DEFAULT_SCREEN_BRIGHTNESS;
 
@@ -218,6 +237,20 @@ struct ChannelListEntry {
 struct UserEntry {
   String nick;
   char prefix = 0;
+};
+
+struct SojuNetwork {
+  String netId;
+  String name;
+  String state;
+  String host;
+  String port;
+  String tls;
+  String nickname;
+  String username;
+  String realname;
+  String pass;
+  String error;
 };
 
 struct Tab {
@@ -569,6 +602,12 @@ class IrcClientApp {
   String _capLsAccum;
   std::vector<String> _serverCaps;
   std::vector<String> _enabledCaps;
+  String _sojuBoundNetId;
+  bool _sojuBindSent = false;
+  bool _sojuListRequested = false;
+  String _sojuNetworkBatchId;
+  std::vector<SojuNetwork> _sojuNetworks;
+  std::vector<SojuNetwork> _sojuBatchNetworks;
 
   bool _saslInProgress = false;
   bool _saslCompleted = false;
@@ -646,6 +685,18 @@ class IrcClientApp {
     return ColorMode::Full;
   }
 
+  static TextOverflowMode parseTextOverflowMode(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "wrap" || s == "line_wrap" || s == "wrapped") return TextOverflowMode::Wrap;
+    return TextOverflowMode::Marquee;
+  }
+
+  static BouncerMode parseBouncerMode(String s) {
+    s = lowerCopy(trimCopy(s));
+    if (s == "soju") return BouncerMode::Soju;
+    return BouncerMode::Generic;
+  }
+
   static String colorModeToString(ColorMode mode) {
     switch (mode) {
       case ColorMode::Full: return "full";
@@ -653,6 +704,22 @@ class IrcClientApp {
       case ColorMode::Mono: return "mono";
     }
     return "full";
+  }
+
+  static String textOverflowModeToString(TextOverflowMode mode) {
+    switch (mode) {
+      case TextOverflowMode::Marquee: return "marquee";
+      case TextOverflowMode::Wrap: return "wrap";
+    }
+    return "marquee";
+  }
+
+  static String bouncerModeToString(BouncerMode mode) {
+    switch (mode) {
+      case BouncerMode::Generic: return "generic";
+      case BouncerMode::Soju: return "soju";
+    }
+    return "generic";
   }
 
   static String proxyTypeToString(ProxyType type) {
@@ -1006,6 +1073,7 @@ class IrcClientApp {
 
   void serviceTextScroll() {
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
+    if (useWrappedText()) return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -1016,15 +1084,36 @@ class IrcClientApp {
   }
 
   void getVisibleBodyRange(const Tab& tab, int& start, int& end, int& maxLines) const {
-    maxLines = BODY_H / (CHAR_H + 2);
+    maxLines = bodyVisibleRows();
     int total = static_cast<int>(tab.lines.size());
     start = std::max(0, total - maxLines - tab.scroll);
     end = std::min(total, start + maxLines);
     if (end - start < maxLines && start > 0) start = std::max(0, end - maxLines);
   }
 
+  bool useWrappedText() const {
+    return _cfg.textOverflowMode == TextOverflowMode::Wrap;
+  }
+
+  int bodyVisibleRows() const {
+    return std::max(1, BODY_H / ROW_H);
+  }
+
+  int bodyWidthForTab(const Tab& tab) const {
+    bool pane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
+    int paneWidth = pane ? NICK_PANE_W : 0;
+    return SCREEN_W - paneWidth - 2;
+  }
+
+  int chatTextWidth(const Tab& tab) const {
+    return bodyWidthForTab(tab) - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+  }
+
   int chatTextWidth() const {
-    return bodyTextWidth() - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    if (_activeTab < 0 || _activeTab >= static_cast<int>(_tabs.size())) {
+      return SCREEN_W - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    }
+    return chatTextWidth(_tabs[_activeTab]);
   }
 
   int measureStyledTextColumns(const String& raw) const {
@@ -1064,6 +1153,94 @@ class IrcClientApp {
     return cols;
   }
 
+  int wrappedTextRows(const String& raw, int maxWidth) const {
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int row = 0;
+    int col = 0;
+    bool sawPrintable = false;
+
+    auto advanceRow = [&]() {
+      ++row;
+      col = 0;
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+        case 0x0F:
+        case 0x16:
+        case 0x1D:
+        case 0x1F:
+          break;
+        case 0x03: {
+          int j = static_cast<int>(i) + 1;
+          int fgDigits = 0;
+          while (j < static_cast<int>(raw.length()) && fgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+            ++j;
+            ++fgDigits;
+          }
+          if (j < static_cast<int>(raw.length()) && raw[j] == ',') {
+            ++j;
+            int bgDigits = 0;
+            while (j < static_cast<int>(raw.length()) && bgDigits < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+              ++j;
+              ++bgDigits;
+            }
+          }
+          i = j - 1;
+          break;
+        }
+        case '\n':
+          advanceRow();
+          sawPrintable = true;
+          break;
+        default:
+          sawPrintable = true;
+          if (col >= charsPerRow) advanceRow();
+          ++col;
+          if (col >= charsPerRow) advanceRow();
+          break;
+      }
+    }
+
+    if (!sawPrintable) return 1;
+    return std::max(1, row + (col > 0 ? 1 : 0));
+  }
+
+  int wrappedRowsForLine(const ChatLine& line, int bodyWidth) const {
+    int textW = bodyWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    if (textW <= 0) return 1;
+    return wrappedTextRows(line.raw, textW);
+  }
+
+  int totalWrappedRows(const Tab& tab, int bodyWidth) const {
+    int total = 0;
+    for (const ChatLine& line : tab.lines) total += wrappedRowsForLine(line, bodyWidth);
+    return std::max(0, total);
+  }
+
+  int maxTabScroll(const Tab& tab) const {
+    if (useWrappedText()) {
+      return std::max(0, totalWrappedRows(tab, bodyWidthForTab(tab)) - bodyVisibleRows());
+    }
+    return std::max(0, static_cast<int>(tab.lines.size()) - bodyVisibleRows());
+  }
+
+  void clampTabScroll(Tab& tab) const {
+    int maxScroll = maxTabScroll(tab);
+    if (tab.scroll < 0) tab.scroll = 0;
+    if (tab.scroll > maxScroll) tab.scroll = maxScroll;
+  }
+
+  int scrollUnitsForLine(const Tab& tab, const ChatLine& line) const {
+    return useWrappedText() ? wrappedRowsForLine(line, bodyWidthForTab(tab)) : 1;
+  }
+
+  void resetAllTabScrolls() {
+    for (Tab& tab : _tabs) tab.scroll = 0;
+  }
+
   int currentTextScrollOffsetCols(const ChatLine& line, int textWidth) const {
     int visibleCols = std::max(1, textWidth / CHAR_W);
     int totalCols = measureStyledTextColumns(line.raw);
@@ -1079,6 +1256,7 @@ class IrcClientApp {
 
   bool activeTabNeedsTextScroll() const {
     if (_activeTab < 0 || _activeTab >= static_cast<int>(_tabs.size())) return false;
+    if (useWrappedText()) return false;
 
     const Tab& tab = _tabs[_activeTab];
     int start = 0;
@@ -1086,7 +1264,7 @@ class IrcClientApp {
     int maxLines = 0;
     getVisibleBodyRange(tab, start, end, maxLines);
 
-    int visibleCols = std::max(1, chatTextWidth() / CHAR_W);
+    int visibleCols = std::max(1, chatTextWidth(tab) / CHAR_W);
     for (int i = start; i < end; ++i) {
       if (measureStyledTextColumns(tab.lines[i].raw) > visibleCols) return true;
     }
@@ -1214,7 +1392,7 @@ class IrcClientApp {
     if (_channelListSelected < 0) _channelListSelected = static_cast<int>(_channelList.size()) - 1;
     if (_channelListSelected >= static_cast<int>(_channelList.size())) _channelListSelected = 0;
 
-    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    int visibleRows = bodyVisibleRows();
     if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
     if (_channelListSelected >= _channelListScroll + visibleRows) {
       _channelListScroll = _channelListSelected - visibleRows + 1;
@@ -1293,6 +1471,8 @@ class IrcClientApp {
       case CFG_PROXY_PASS:
       case CFG_BNC_USER:
       case CFG_BNC_NETWORK:
+      case CFG_BNC_CLIENT:
+      case CFG_SOJU_BIND_NETID:
       case CFG_BNC_PASS:
       case CFG_SASL_USER:
       case CFG_SASL_PASS:
@@ -1327,8 +1507,11 @@ class IrcClientApp {
       case CFG_PROXY_USER: return "proxy_user";
       case CFG_PROXY_PASS: return "proxy_pass";
       case CFG_BNC_ENABLED: return "bnc_enabled";
+      case CFG_BNC_MODE: return "bnc_mode";
       case CFG_BNC_USER: return "bnc_user";
       case CFG_BNC_NETWORK: return "bnc_network";
+      case CFG_BNC_CLIENT: return "bnc_client";
+      case CFG_SOJU_BIND_NETID: return "soju_bind_netid";
       case CFG_BNC_PASS: return "bnc_pass";
       case CFG_SASL_ENABLED: return "sasl_enabled";
       case CFG_SASL_USER: return "sasl_user";
@@ -1337,6 +1520,7 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return "color_mode";
       case CFG_PERSIST_TABS: return "persist_tabs";
       case CFG_SHOW_CONTROL_GLYPHS: return "ctrl_glyphs";
+      case CFG_TEXT_OVERFLOW: return "text_overflow";
       case CFG_SCREEN_TIMEOUT: return "screen_timeout_sec";
       case CFG_SCREEN_BRIGHTNESS: return "screen_brightness";
       case CFG_LOG_ROOT: return "log_root";
@@ -1366,8 +1550,11 @@ class IrcClientApp {
       case CFG_PROXY_USER: return _editCfg.proxyUser;
       case CFG_PROXY_PASS: return masked ? maskSecret(_editCfg.proxyPass) : _editCfg.proxyPass;
       case CFG_BNC_ENABLED: return boolToOnOff(_editCfg.bncEnabled);
+      case CFG_BNC_MODE: return bouncerModeToString(_editCfg.bncMode);
       case CFG_BNC_USER: return _editCfg.bncUser;
       case CFG_BNC_NETWORK: return _editCfg.bncNetwork;
+      case CFG_BNC_CLIENT: return _editCfg.bncClient;
+      case CFG_SOJU_BIND_NETID: return _editCfg.sojuBindNetId;
       case CFG_BNC_PASS: return masked ? maskSecret(_editCfg.bncPass) : _editCfg.bncPass;
       case CFG_SASL_ENABLED: return boolToOnOff(_editCfg.saslEnabled);
       case CFG_SASL_USER: return _editCfg.saslUser;
@@ -1376,6 +1563,7 @@ class IrcClientApp {
       case CFG_COLOR_MODE: return colorModeToString(_editCfg.colorMode);
       case CFG_PERSIST_TABS: return boolToOnOff(_editCfg.persistTabs);
       case CFG_SHOW_CONTROL_GLYPHS: return boolToOnOff(_editCfg.showControlGlyphs);
+      case CFG_TEXT_OVERFLOW: return textOverflowModeToString(_editCfg.textOverflowMode);
       case CFG_SCREEN_TIMEOUT: return String(_editCfg.screenTimeoutSec);
       case CFG_SCREEN_BRIGHTNESS: return String(_editCfg.screenBrightness);
       case CFG_LOG_ROOT: return _editCfg.logRoot;
@@ -1406,11 +1594,15 @@ class IrcClientApp {
       case CFG_PROXY_PORT: _editCfg.proxyPort = static_cast<uint16_t>(std::max<long>(0, value.toInt())); break;
       case CFG_PROXY_USER: _editCfg.proxyUser = value; break;
       case CFG_PROXY_PASS: _editCfg.proxyPass = value; break;
+      case CFG_BNC_MODE: _editCfg.bncMode = parseBouncerMode(value); break;
       case CFG_BNC_USER: _editCfg.bncUser = value; break;
       case CFG_BNC_NETWORK: _editCfg.bncNetwork = value; break;
+      case CFG_BNC_CLIENT: _editCfg.bncClient = value; break;
+      case CFG_SOJU_BIND_NETID: _editCfg.sojuBindNetId = value; break;
       case CFG_BNC_PASS: _editCfg.bncPass = value; break;
       case CFG_SASL_USER: _editCfg.saslUser = value; break;
       case CFG_SASL_PASS: _editCfg.saslPass = value; break;
+      case CFG_TEXT_OVERFLOW: _editCfg.textOverflowMode = parseTextOverflowMode(value); break;
       case CFG_SCREEN_TIMEOUT: _editCfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt()); break;
       case CFG_SCREEN_BRIGHTNESS: _editCfg.screenBrightness = clampScreenBrightnessLevel(value.toInt()); break;
       case CFG_LOG_ROOT: _editCfg.logRoot = value; break;
@@ -1422,7 +1614,7 @@ class IrcClientApp {
     _configSelected += delta;
     if (_configSelected < 0) _configSelected = CFG_COUNT - 1;
     if (_configSelected >= CFG_COUNT) _configSelected = 0;
-    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    int visibleRows = bodyVisibleRows();
     if (_configSelected < _configScroll) _configScroll = _configSelected;
     if (_configSelected >= _configScroll + visibleRows) _configScroll = _configSelected - visibleRows + 1;
     if (_configScroll < 0) _configScroll = 0;
@@ -1454,8 +1646,11 @@ class IrcClientApp {
     f.println("proxy_user=" + cfg.proxyUser);
     f.println("proxy_pass=" + cfg.proxyPass);
     f.println("bnc_enabled=" + String(cfg.bncEnabled ? "true" : "false"));
+    f.println("bnc_mode=" + bouncerModeToString(cfg.bncMode));
     f.println("bnc_user=" + cfg.bncUser);
     f.println("bnc_network=" + cfg.bncNetwork);
+    f.println("bnc_client=" + cfg.bncClient);
+    f.println("soju_bind_netid=" + cfg.sojuBindNetId);
     f.println("bnc_pass=" + cfg.bncPass);
     f.println("sasl_enabled=" + String(cfg.saslEnabled ? "true" : "false"));
     f.println("sasl_user=" + cfg.saslUser);
@@ -1468,6 +1663,7 @@ class IrcClientApp {
     f.println("color_mode=" + colorModeToString(cfg.colorMode));
     f.println("show_control_glyphs=" + String(cfg.showControlGlyphs ? "true" : "false"));
     f.println("persist_tabs=" + String(cfg.persistTabs ? "true" : "false"));
+    f.println("text_overflow=" + textOverflowModeToString(cfg.textOverflowMode));
     f.println("screen_timeout_sec=" + String(cfg.screenTimeoutSec));
     f.println("screen_brightness=" + String(cfg.screenBrightness));
     f.close();
@@ -1495,6 +1691,9 @@ class IrcClientApp {
       case CFG_BNC_ENABLED:
         _editCfg.bncEnabled = !_editCfg.bncEnabled;
         break;
+      case CFG_BNC_MODE:
+        _editCfg.bncMode = (_editCfg.bncMode == BouncerMode::Generic) ? BouncerMode::Soju : BouncerMode::Generic;
+        break;
       case CFG_SASL_ENABLED:
         _editCfg.saslEnabled = !_editCfg.saslEnabled;
         break;
@@ -1512,10 +1711,18 @@ class IrcClientApp {
       case CFG_SHOW_CONTROL_GLYPHS:
         _editCfg.showControlGlyphs = !_editCfg.showControlGlyphs;
         break;
+      case CFG_TEXT_OVERFLOW:
+        _editCfg.textOverflowMode = (_editCfg.textOverflowMode == TextOverflowMode::Marquee)
+          ? TextOverflowMode::Wrap
+          : TextOverflowMode::Marquee;
+        break;
       case CFG_SAVE_AND_RECONNECT:
         if (_editCfg.reconnectInitialMs == 0) _editCfg.reconnectInitialMs = 3000;
         if (_editCfg.reconnectMaxMs < _editCfg.reconnectInitialMs) _editCfg.reconnectMaxMs = _editCfg.reconnectInitialMs;
         saveConfigToSD(_editCfg);
+        if (_cfg.textOverflowMode != _editCfg.textOverflowMode || _cfg.nickPaneEnabled != _editCfg.nickPaneEnabled) {
+          resetAllTabScrolls();
+        }
         _cfg = _editCfg;
         _selfNick = _cfg.nick;
         _currentReconnectDelayMs = _cfg.reconnectInitialMs;
@@ -1635,8 +1842,11 @@ class IrcClientApp {
       else if (key == "proxy_user") _cfg.proxyUser = value;
       else if (key == "proxy_pass") _cfg.proxyPass = value;
       else if (key == "bnc_enabled") _cfg.bncEnabled = strToBool(value);
+      else if (key == "bnc_mode") _cfg.bncMode = parseBouncerMode(value);
       else if (key == "bnc_user") _cfg.bncUser = value;
       else if (key == "bnc_network") _cfg.bncNetwork = value;
+      else if (key == "bnc_client") _cfg.bncClient = value;
+      else if (key == "soju_bind_netid") _cfg.sojuBindNetId = value;
       else if (key == "bnc_pass") _cfg.bncPass = value;
       else if (key == "sasl_enabled") _cfg.saslEnabled = strToBool(value);
       else if (key == "sasl_user") _cfg.saslUser = value;
@@ -1649,6 +1859,7 @@ class IrcClientApp {
       else if (key == "color_mode") _cfg.colorMode = parseColorMode(value);
       else if (key == "show_control_glyphs") _cfg.showControlGlyphs = strToBool(value);
       else if (key == "persist_tabs") _cfg.persistTabs = strToBool(value);
+      else if (key == "text_overflow" || key == "chat_text_mode") _cfg.textOverflowMode = parseTextOverflowMode(value);
       else if (key == "screen_timeout_sec") _cfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt());
       else if (key == "screen_brightness") _cfg.screenBrightness = clampScreenBrightnessLevel(value.toInt());
     }
@@ -1794,6 +2005,12 @@ class IrcClientApp {
     _capLsAccum = "";
     _serverCaps.clear();
     _enabledCaps.clear();
+    _sojuBoundNetId = "";
+    _sojuBindSent = false;
+    _sojuListRequested = false;
+    _sojuNetworkBatchId = "";
+    _sojuBatchNetworks.clear();
+    _sojuNetworks.clear();
     _saslInProgress = false;
     _saslCompleted = false;
     _saslWaitingForChallenge = false;
@@ -1831,6 +2048,12 @@ class IrcClientApp {
         _capLsAccum = "";
         _serverCaps.clear();
         _enabledCaps.clear();
+        _sojuBoundNetId = "";
+        _sojuBindSent = false;
+        _sojuListRequested = false;
+        _sojuNetworkBatchId = "";
+        _sojuBatchNetworks.clear();
+        _sojuNetworks.clear();
         _saslInProgress = false;
         _saslCompleted = false;
         _saslWaitingForChallenge = false;
@@ -1876,17 +2099,62 @@ class IrcClientApp {
     if (!passLine.isEmpty()) sendRawNoEcho("PASS " + passLine);
     sendRawNoEcho("CAP LS 302");
     sendRawNoEcho("NICK " + _cfg.nick);
-    sendRawNoEcho("USER " + _cfg.username + " 0 * :" + _cfg.realname);
+    sendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _cfg.realname);
+  }
+
+  String buildSojuIdentity(const String& overrideUser = "") const {
+    String user = trimCopy(overrideUser);
+    if (user.isEmpty()) user = _cfg.bncUser;
+    if (user.isEmpty()) return user;
+
+    bool hasNetwork = user.indexOf('/') >= 0;
+    bool hasClient = user.indexOf('@') >= 0;
+    if (!hasNetwork && !_cfg.bncNetwork.isEmpty()) {
+      user += "/" + _cfg.bncNetwork;
+    }
+    if (!hasClient && !_cfg.bncClient.isEmpty()) {
+      user += "@" + _cfg.bncClient;
+    }
+    return user;
+  }
+
+  String buildRegistrationUsername() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
+    }
+    return _cfg.username;
   }
 
   String buildPassLine() const {
     if (!_cfg.serverPass.isEmpty()) return _cfg.serverPass;
     if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) {
+      if (_cfg.bncMode == BouncerMode::Soju) {
+        return _cfg.saslEnabled ? "" : _cfg.bncPass;
+      }
       String left = _cfg.bncUser;
       if (!_cfg.bncNetwork.isEmpty()) left += "/" + _cfg.bncNetwork;
       if (!left.isEmpty()) return left + ":" + _cfg.bncPass;
       return _cfg.bncPass;
     }
+    return "";
+  }
+
+  String buildSaslUser() const {
+    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+      String explicitUser = trimCopy(_cfg.saslUser);
+      if (!explicitUser.isEmpty()) return buildSojuIdentity(explicitUser);
+      String user = buildSojuIdentity();
+      if (!user.isEmpty()) return user;
+    }
+    if (!_cfg.saslUser.isEmpty()) return _cfg.saslUser;
+    if (_cfg.bncEnabled && !_cfg.bncUser.isEmpty()) return _cfg.bncUser;
+    return _cfg.nick;
+  }
+
+  String buildSaslPass() const {
+    if (!_cfg.saslPass.isEmpty()) return _cfg.saslPass;
+    if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) return _cfg.bncPass;
     return "";
   }
 
@@ -1985,6 +2253,90 @@ class IrcClientApp {
     return "";
   }
 
+  std::vector<TagEntry> parseTagEntries(const String& raw) const {
+    std::vector<TagEntry> entries;
+    int start = 0;
+    while (start <= static_cast<int>(raw.length())) {
+      int semi = raw.indexOf(';', start);
+      String token = semi < 0 ? raw.substring(start) : raw.substring(start, semi);
+      if (!token.isEmpty()) {
+        int eq = token.indexOf('=');
+        TagEntry entry;
+        entry.key = eq >= 0 ? token.substring(0, eq) : token;
+        entry.value = eq >= 0 ? decodeTagValue(token.substring(eq + 1)) : "";
+        entries.push_back(entry);
+      }
+      if (semi < 0) break;
+      start = semi + 1;
+    }
+    return entries;
+  }
+
+  void applySojuNetworkAttribute(SojuNetwork& network, const String& key, const String& value) {
+    if (key == "name") network.name = value;
+    else if (key == "state") network.state = value;
+    else if (key == "host") network.host = value;
+    else if (key == "port") network.port = value;
+    else if (key == "tls") network.tls = value;
+    else if (key == "nickname") network.nickname = value;
+    else if (key == "username") network.username = value;
+    else if (key == "realname") network.realname = value;
+    else if (key == "pass") network.pass = value;
+    else if (key == "error") network.error = value;
+  }
+
+  void applySojuNetworkAttributes(SojuNetwork& network, const String& attrsRaw) {
+    for (const TagEntry& entry : parseTagEntries(attrsRaw)) {
+      applySojuNetworkAttribute(network, entry.key, entry.value);
+    }
+  }
+
+  void removeSojuNetworkById(std::vector<SojuNetwork>& list, const String& netId) {
+    for (size_t i = 0; i < list.size(); ++i) {
+      if (list[i].netId == netId) {
+        list.erase(list.begin() + i);
+        return;
+      }
+    }
+  }
+
+  SojuNetwork& ensureSojuNetwork(std::vector<SojuNetwork>& list, const String& netId) {
+    for (SojuNetwork& network : list) {
+      if (network.netId == netId) return network;
+    }
+    SojuNetwork network;
+    network.netId = netId;
+    list.push_back(network);
+    return list.back();
+  }
+
+  String sojuNetworkLabel(const SojuNetwork& network) const {
+    if (!network.name.isEmpty()) return network.name;
+    if (!network.host.isEmpty()) return network.host;
+    return network.netId;
+  }
+
+  String summarizeSojuNetwork(const SojuNetwork& network) const {
+    String line = "[" + network.netId + "] " + sojuNetworkLabel(network);
+    if (!network.state.isEmpty()) line += " state=" + network.state;
+    if (!network.host.isEmpty() && !equalsIgnoreCase(network.host, sojuNetworkLabel(network))) line += " host=" + network.host;
+    if (!network.port.isEmpty()) line += ":" + network.port;
+    if (!network.tls.isEmpty()) line += String(" tls=") + (network.tls == "1" ? "on" : "off");
+    if (!network.error.isEmpty()) line += " error=" + network.error;
+    return line;
+  }
+
+  void appendSojuNetworksToStatus() {
+    if (_sojuNetworks.empty()) {
+      appendLine(statusTab(), "*** soju networks: none");
+      return;
+    }
+    appendLine(statusTab(), "*** soju networks: " + String(_sojuNetworks.size()));
+    for (const SojuNetwork& network : _sojuNetworks) {
+      appendLine(statusTab(), "*** " + summarizeSojuNetwork(network));
+    }
+  }
+
   String messageStampShort(const IrcMessage& msg) const {
     String t = getTagValue(msg, "time");
     if (t.length() >= 16 && t.indexOf('T') >= 0) {
@@ -2027,11 +2379,29 @@ class IrcClientApp {
       return;
     }
 
+    if (msg.command == "BATCH") {
+      handleBatch(msg);
+      return;
+    }
+
+    if (msg.command == "BOUNCER") {
+      handleBouncer(msg);
+      return;
+    }
+
+    if (msg.command == "FAIL") {
+      handleFail(msg);
+      return;
+    }
+
     if (msg.command == "001") {
       _ircRegistered = true;
       _selfNick = _cfg.nick;
       resetReconnectBackoff();
       appendLine(statusTab(), "*** Registered on IRC", messageStampShort(msg), messageStampLog(msg));
+      if (capEnabled("soju.im/bouncer-networks") && !capEnabled("soju.im/bouncer-networks-notify")) {
+        sendRawNoEcho("BOUNCER LISTNETWORKS");
+      }
       autoJoinRestoredChannels();
       return;
     }
@@ -2055,6 +2425,7 @@ class IrcClientApp {
       _saslWaitingForChallenge = false;
       appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
       if (!_capNegotiationDone) {
+        maybeSendSojuBind();
         sendRaw("CAP END");
         _capNegotiationDone = true;
       }
@@ -2134,6 +2505,99 @@ class IrcClientApp {
     appendLine(statusTab(), raw, messageStampShort(msg), messageStampLog(msg));
   }
 
+  void handleBatch(const IrcMessage& msg) {
+    if (msg.params.empty()) return;
+    String ref = msg.params[0];
+    if (ref.length() < 2) return;
+
+    char sign = ref[0];
+    String batchId = ref.substring(1);
+    if (sign == '+') {
+      String type = msg.params.size() > 1 ? msg.params[1] : "";
+      if (equalsIgnoreCase(type, "soju.im/bouncer-networks")) {
+        _sojuNetworkBatchId = batchId;
+        _sojuBatchNetworks.clear();
+      }
+      return;
+    }
+
+    if (sign == '-' && batchId == _sojuNetworkBatchId) {
+      _sojuNetworkBatchId = "";
+      _sojuNetworks = _sojuBatchNetworks;
+      _sojuBatchNetworks.clear();
+      if (_sojuListRequested) {
+        appendSojuNetworksToStatus();
+        _sojuListRequested = false;
+      } else {
+        appendLine(statusTab(), "*** soju networks synced: " + String(_sojuNetworks.size()));
+      }
+    }
+  }
+
+  void handleBouncerNetwork(const IrcMessage& msg) {
+    if (msg.params.size() < 2) return;
+    String netId = msg.params[1];
+    bool inBatch = !_sojuNetworkBatchId.isEmpty() && getTagValue(msg, "batch") == _sojuNetworkBatchId;
+    std::vector<SojuNetwork>& list = inBatch ? _sojuBatchNetworks : _sojuNetworks;
+
+    if (msg.params.size() >= 3 && msg.params[2] == "*") {
+      removeSojuNetworkById(list, netId);
+      if (!inBatch) appendLine(statusTab(), "*** soju network removed: [" + netId + "]");
+      if (_sojuBoundNetId == netId) _sojuBoundNetId = "";
+      return;
+    }
+
+    String attrs = msg.params.size() >= 3 ? msg.params[2] : "";
+    SojuNetwork& network = ensureSojuNetwork(list, netId);
+    applySojuNetworkAttributes(network, attrs);
+    if (!inBatch) appendLine(statusTab(), "*** soju network: " + summarizeSojuNetwork(network));
+  }
+
+  void handleBouncer(const IrcMessage& msg) {
+    if (msg.params.empty()) return;
+    String sub = msg.params[0];
+    sub.toUpperCase();
+
+    if (sub == "NETWORK") {
+      handleBouncerNetwork(msg);
+      return;
+    }
+    if (sub == "ADDNETWORK" && msg.params.size() >= 2) {
+      appendLine(statusTab(), "*** soju addnetwork ok: [" + msg.params[1] + "]");
+      return;
+    }
+    if (sub == "CHANGENETWORK" && msg.params.size() >= 2) {
+      appendLine(statusTab(), "*** soju changenetwork ok: [" + msg.params[1] + "]");
+      return;
+    }
+    if (sub == "DELNETWORK" && msg.params.size() >= 2) {
+      appendLine(statusTab(), "*** soju delnetwork ok: [" + msg.params[1] + "]");
+      return;
+    }
+    if (sub == "BIND" && msg.params.size() >= 2) {
+      _sojuBoundNetId = msg.params[1];
+      _sojuBindSent = true;
+      appendLine(statusTab(), "*** soju bound network: [" + _sojuBoundNetId + "]");
+      return;
+    }
+
+    appendLine(statusTab(), "*** BOUNCER " + joinStrings(msg.params, " "));
+  }
+
+  void handleFail(const IrcMessage& msg) {
+    if (msg.params.empty()) {
+      appendLine(statusTab(), "*** FAIL");
+      return;
+    }
+    if (equalsIgnoreCase(msg.params[0], "BOUNCER")) {
+      String line = "*** BOUNCER FAIL";
+      for (const String& param : msg.params) line += " " + param;
+      appendLine(statusTab(), line);
+      return;
+    }
+    appendLine(statusTab(), "*** FAIL " + joinStrings(msg.params, " "));
+  }
+
   void autoJoinRestoredChannels() {
     std::vector<String> joined;
     for (const String& c : _cfg.autoJoin) {
@@ -2178,6 +2642,13 @@ class IrcClientApp {
     return false;
   }
 
+  bool capEnabled(const String& capName) const {
+    for (const String& cap : _enabledCaps) {
+      if (equalsIgnoreCase(cap, capName)) return true;
+    }
+    return false;
+  }
+
   void setEnabledCap(const String& capName, bool enabled) {
     for (size_t i = 0; i < _enabledCaps.size(); ++i) {
       if (equalsIgnoreCase(_enabledCaps[i], capName)) {
@@ -2186,6 +2657,21 @@ class IrcClientApp {
       }
     }
     if (enabled) _enabledCaps.push_back(capName);
+  }
+
+  void maybeSendSojuBind() {
+    if (!_cfg.bncEnabled || _cfg.bncMode != BouncerMode::Soju) return;
+    if (_sojuBindSent || _ircRegistered) return;
+    if (!capEnabled("soju.im/bouncer-networks")) return;
+
+    String netId = trimCopy(_cfg.sojuBindNetId);
+    if (netId.isEmpty()) return;
+
+    bool waitingOnSasl = capEnabled("sasl") && _cfg.saslEnabled && !_saslCompleted;
+    if (waitingOnSasl) return;
+
+    sendRaw("BOUNCER BIND " + netId);
+    _sojuBindSent = true;
   }
 
   void handleCap(const IrcMessage& msg) {
@@ -2210,6 +2696,12 @@ class IrcClientApp {
       if (serverSupportsCap("server-time")) want.push_back("server-time");
       if (serverSupportsCap("message-tags")) want.push_back("message-tags");
       if (_cfg.saslEnabled && serverSupportsCap("sasl")) want.push_back("sasl");
+      if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju && serverSupportsCap("soju.im/bouncer-networks")) {
+        want.push_back("soju.im/bouncer-networks");
+        if (serverSupportsCap("soju.im/bouncer-networks-notify")) {
+          want.push_back("soju.im/bouncer-networks-notify");
+        }
+      }
 
       if (!want.empty() && (sub == "NEW" || !_capRequestSent)) {
         sendRaw("CAP REQ :" + joinStrings(want, " "));
@@ -2241,6 +2733,7 @@ class IrcClientApp {
         _saslWaitingForChallenge = true;
         sendRaw("AUTHENTICATE PLAIN");
       } else if (!_capNegotiationDone && !_saslInProgress) {
+        maybeSendSojuBind();
         sendRaw("CAP END");
         _capNegotiationDone = true;
       }
@@ -2303,14 +2796,15 @@ class IrcClientApp {
   }
 
   void sendSaslPlainPayload() {
-    String user = _cfg.saslUser.isEmpty() ? _cfg.nick : _cfg.saslUser;
+    String user = buildSaslUser();
+    String pass = buildSaslPass();
     std::vector<uint8_t> payload;
-    payload.reserve(user.length() * 2 + _cfg.saslPass.length() + 2);
+    payload.reserve(user.length() * 2 + pass.length() + 2);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
     for (size_t i = 0; i < user.length(); ++i) payload.push_back(static_cast<uint8_t>(user[i]));
     payload.push_back(0);
-    for (size_t i = 0; i < _cfg.saslPass.length(); ++i) payload.push_back(static_cast<uint8_t>(_cfg.saslPass[i]));
+    for (size_t i = 0; i < pass.length(); ++i) payload.push_back(static_cast<uint8_t>(pass[i]));
 
     String encoded = base64EncodeBytes(payload.data(), payload.size());
     const int chunkSize = 400;
@@ -2343,6 +2837,9 @@ class IrcClientApp {
           _prefixModes = token.substring(lp + 1, rp);
           _prefixSymbols = token.substring(rp + 1);
         }
+      } else if (token.startsWith("BOUNCER_NETID")) {
+        int eq = token.indexOf('=');
+        _sojuBoundNetId = eq >= 0 ? token.substring(eq + 1) : "";
       }
     }
     appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
@@ -2516,6 +3013,10 @@ class IrcClientApp {
     line.notice = notice;
     tab.lines.push_back(line);
     if (tab.lines.size() > MAX_TAB_LINES) tab.lines.erase(tab.lines.begin());
+    if (tab.scroll > 0) {
+      tab.scroll += scrollUnitsForLine(tab, line);
+      clampTabScroll(tab);
+    }
     if (&tab != &_tabs[_activeTab]) {
       tab.unread = true;
       if (highlight) tab.mention = true;
@@ -2576,7 +3077,11 @@ class IrcClientApp {
     if (!tab) return;
 
     if (equalsIgnoreCase(nick, _selfNick)) {
-      appendLine(*tab, "*** You parted " + channel + (reason.isEmpty() ? "" : " (" + reason + ")"), messageStampShort(msg), messageStampLog(msg));
+      if (equalsIgnoreCase(reason, "detach")) {
+        appendLine(*tab, "*** Detached " + channel, messageStampShort(msg), messageStampLog(msg));
+      } else {
+        appendLine(*tab, "*** You parted " + channel + (reason.isEmpty() ? "" : " (" + reason + ")"), messageStampShort(msg), messageStampLog(msg));
+      }
       clearUsers(*tab);
     } else {
       appendLine(*tab, "*** " + nick + " parted" + (reason.isEmpty() ? "" : " (" + reason + ")"), messageStampShort(msg), messageStampLog(msg));
@@ -2763,6 +3268,7 @@ class IrcClientApp {
 
   void applyKeyboardScroll(Tab& tab, int delta) {
     tab.scroll = std::max(0, tab.scroll + delta);
+    clampTabScroll(tab);
     _dirty = true;
   }
 
@@ -2770,7 +3276,7 @@ class IrcClientApp {
     if (_tabs.empty()) return false;
 
     Tab& tab = _tabs[_activeTab];
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int page = std::max(1, bodyVisibleRows() - 1);
 
     switch (c) {
       case ';':
@@ -2900,14 +3406,121 @@ class IrcClientApp {
     mode.toLowerCase();
     int n = countStr.isEmpty() ? 1 : std::max(1, static_cast<int>(countStr.toInt()));
 
-    int page = std::max(1, BODY_H / (CHAR_H + 2) - 1);
+    int page = std::max(1, bodyVisibleRows() - 1);
     if (mode == "up") tab.scroll += n;
     else if (mode == "down") tab.scroll = std::max(0, tab.scroll - n);
     else if (mode == "pageup") tab.scroll += n * page;
     else if (mode == "pagedown") tab.scroll = std::max(0, tab.scroll - (n * page));
-    else if (mode == "top") tab.scroll = static_cast<int>(tab.lines.size());
+    else if (mode == "top") tab.scroll = maxTabScroll(tab);
     else if (mode == "bottom") tab.scroll = 0;
-    if (tab.scroll < 0) tab.scroll = 0;
+    clampTabScroll(tab);
+  }
+
+  bool ensureSojuCommandReady(bool requireCap = true) {
+    if (!_cfg.bncEnabled || _cfg.bncMode != BouncerMode::Soju) {
+      appendLine(statusTab(), "*** Soju mode is not enabled");
+      return false;
+    }
+    if (requireCap && !capEnabled("soju.im/bouncer-networks")) {
+      appendLine(statusTab(), "*** soju.im/bouncer-networks is not active on this connection");
+      return false;
+    }
+    return true;
+  }
+
+  void handleSojuCommand(String args) {
+    String sub;
+    String rest;
+    int sp = args.indexOf(' ');
+    if (sp < 0) sub = trimCopy(args);
+    else {
+      sub = trimCopy(args.substring(0, sp));
+      rest = trimCopy(args.substring(sp + 1));
+    }
+    sub.toLowerCase();
+
+    if (sub.isEmpty() || sub == "status") {
+      appendLine(statusTab(), "*** soju mode=" + bouncerModeToString(_cfg.bncMode) +
+        " cap=" + String(capEnabled("soju.im/bouncer-networks") ? "on" : "off") +
+        " notify=" + String(capEnabled("soju.im/bouncer-networks-notify") ? "on" : "off"));
+      appendLine(statusTab(), "*** soju bound=" + (_sojuBoundNetId.isEmpty() ? String("(none)") : _sojuBoundNetId) +
+        " config_bind=" + (_cfg.sojuBindNetId.isEmpty() ? String("(none)") : _cfg.sojuBindNetId));
+      return;
+    }
+
+    if (sub == "networks" || sub == "list") {
+      if (!ensureSojuCommandReady()) return;
+      _sojuListRequested = true;
+      sendRaw("BOUNCER LISTNETWORKS");
+      return;
+    }
+
+    if (sub == "cached") {
+      appendSojuNetworksToStatus();
+      return;
+    }
+
+    if (sub == "add") {
+      if (!ensureSojuCommandReady()) return;
+      if (rest.isEmpty()) {
+        appendLine(statusTab(), "*** Usage: /soju add name=...;host=...");
+        return;
+      }
+      sendRaw("BOUNCER ADDNETWORK " + rest);
+      return;
+    }
+
+    if (sub == "change") {
+      if (!ensureSojuCommandReady()) return;
+      int argSp = rest.indexOf(' ');
+      if (argSp <= 0) {
+        appendLine(statusTab(), "*** Usage: /soju change <netid> key=value;...");
+        return;
+      }
+      String netId = trimCopy(rest.substring(0, argSp));
+      String attrs = trimCopy(rest.substring(argSp + 1));
+      if (attrs.isEmpty()) {
+        appendLine(statusTab(), "*** Usage: /soju change <netid> key=value;...");
+        return;
+      }
+      sendRaw("BOUNCER CHANGENETWORK " + netId + " " + attrs);
+      return;
+    }
+
+    if (sub == "del" || sub == "delete" || sub == "rm") {
+      if (!ensureSojuCommandReady()) return;
+      if (rest.isEmpty()) {
+        appendLine(statusTab(), "*** Usage: /soju del <netid>");
+        return;
+      }
+      sendRaw("BOUNCER DELNETWORK " + rest);
+      return;
+    }
+
+    if (sub == "bind") {
+      if (!ensureSojuCommandReady(false)) return;
+      if (rest.isEmpty()) {
+        appendLine(statusTab(), "*** soju bind target = " + (_cfg.sojuBindNetId.isEmpty() ? String("(none)") : _cfg.sojuBindNetId));
+        return;
+      }
+      if (rest == "off" || rest == "clear" || rest == "none") {
+        _cfg.sojuBindNetId = "";
+        _sojuBindSent = false;
+        appendLine(statusTab(), "*** Cleared soju bind target for next reconnect");
+        return;
+      }
+      _cfg.sojuBindNetId = rest;
+      _sojuBindSent = false;
+      appendLine(statusTab(), "*** soju bind target set to [" + rest + "] for next reconnect");
+      if (_ircRegistered) {
+        scheduleReconnect("Reconnecting to bind soju network " + rest);
+      } else {
+        maybeSendSojuBind();
+      }
+      return;
+    }
+
+    appendLine(statusTab(), "*** Unknown /soju action: " + sub);
   }
 
   void handleCommand(const String& cmdLine) {
@@ -2946,6 +3559,14 @@ class IrcClientApp {
       }
       if (!target.isEmpty()) {
         sendRaw("PART " + target + (reason.isEmpty() ? "" : " :" + reason));
+      }
+      return;
+    }
+
+    if (cmd == "detach") {
+      String target = args.isEmpty() ? _tabs[_activeTab].name : args;
+      if (!target.isEmpty()) {
+        sendRaw("PART " + target + " :detach");
       }
       return;
     }
@@ -3129,6 +3750,11 @@ class IrcClientApp {
       return;
     }
 
+    if (cmd == "soju" || cmd == "bouncer") {
+      handleSojuCommand(args);
+      return;
+    }
+
     if (cmd == "quote" || cmd == "raw") {
       if (!args.isEmpty()) sendRaw(args);
       return;
@@ -3210,7 +3836,7 @@ class IrcClientApp {
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
-    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    int visibleRows = bodyVisibleRows();
     if (_configSelected < _configScroll) _configScroll = _configSelected;
     if (_configSelected >= _configScroll + visibleRows) _configScroll = _configSelected - visibleRows + 1;
     if (_configScroll < 0) _configScroll = 0;
@@ -3240,7 +3866,7 @@ class IrcClientApp {
         gfx.print(value);
       }
 
-      y += CHAR_H + 2;
+      y += ROW_H;
     }
 
     int inputY = SCREEN_H - INPUT_H;
@@ -3287,7 +3913,7 @@ class IrcClientApp {
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
-    int visibleRows = std::max(1, BODY_H / (CHAR_H + 2));
+    int visibleRows = bodyVisibleRows();
     if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
     if (_channelListSelected >= _channelListScroll + visibleRows) {
       _channelListScroll = _channelListSelected - visibleRows + 1;
@@ -3316,7 +3942,7 @@ class IrcClientApp {
         gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
         gfx.setCursor(10, y);
         gfx.print(ellipsize(row, 37));
-        y += CHAR_H + 2;
+        y += ROW_H;
       }
     }
 
@@ -3409,18 +4035,23 @@ class IrcClientApp {
   }
 
   int bodyTextWidth() const {
-    const Tab& tab = _tabs[_activeTab];
-    bool pane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
-    int paneWidth = pane ? NICK_PANE_W : 0;
-    return SCREEN_W - paneWidth - 2;
+    if (_activeTab < 0 || _activeTab >= static_cast<int>(_tabs.size())) return SCREEN_W - 2;
+    return bodyWidthForTab(_tabs[_activeTab]);
   }
 
   void drawBody() {
+    if (useWrappedText()) {
+      drawWrappedBody();
+      return;
+    }
+    drawMarqueeBody();
+  }
+
+  void drawMarqueeBody() {
     auto& gfx = drawTarget();
     const Tab& tab = _tabs[_activeTab];
     bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
-    int paneWidth = showPane ? NICK_PANE_W : 0;
-    int textWidth = SCREEN_W - paneWidth - 2;
+    int textWidth = bodyWidthForTab(tab);
     int start = 0;
     int end = 0;
     int maxLines = 0;
@@ -3430,14 +4061,48 @@ class IrcClientApp {
 
     int y = BODY_Y + 1;
     for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
-      drawChatLine(0, y, tab.lines[i], textWidth);
-      y += CHAR_H + 2;
+      drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
+      y += ROW_H;
     }
 
     if (showPane) drawNickPane(tab);
   }
 
-  void drawChatLine(int x, int y, const ChatLine& line, int maxWidth) {
+  void drawWrappedBody() {
+    auto& gfx = drawTarget();
+    Tab& tab = _tabs[_activeTab];
+    bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
+    int textWidth = bodyWidthForTab(tab);
+    clampTabScroll(tab);
+    int visibleRows = bodyVisibleRows();
+    int totalRows = totalWrappedRows(tab, textWidth);
+    int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
+
+    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+
+    int y = BODY_Y + 1;
+    int drawnRows = 0;
+    int currentRow = 0;
+    for (const ChatLine& line : tab.lines) {
+      int lineRows = wrappedRowsForLine(line, textWidth);
+      if (currentRow + lineRows <= startRow) {
+        currentRow += lineRows;
+        continue;
+      }
+      int skipRows = std::max(0, startRow - currentRow);
+      int rowsLeft = visibleRows - drawnRows;
+      if (rowsLeft <= 0) break;
+      int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
+      drawnRows += usedRows;
+      y += usedRows * ROW_H;
+      currentRow += lineRows;
+      if (drawnRows >= visibleRows || y >= BODY_Y + BODY_H - CHAR_H) break;
+    }
+
+    if (showPane) drawNickPane(tab);
+  }
+
+  void drawMarqueeChatLine(int x, int y, const ChatLine& line, int maxWidth) {
     auto& gfx = drawTarget();
     uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
     gfx.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
@@ -3455,6 +4120,34 @@ class IrcClientApp {
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
     drawStyledText(textX, y, line.raw, textW, lineBg, currentTextScrollOffsetCols(line, textW));
+  }
+
+  int drawWrappedChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
+    auto& gfx = drawTarget();
+    uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
+    int totalRows = wrappedRowsForLine(line, maxWidth);
+    int rowsToDraw = std::max(0, std::min(maxRows, totalRows - skipRows));
+    for (int row = 0; row < rowsToDraw; ++row) {
+      int rowY = y + row * ROW_H;
+      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, lineBg);
+    }
+    if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
+      gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+    }
+
+    if (skipRows == 0 && rowsToDraw > 0) {
+      int stampX = x + 2;
+      gfx.setTextColor(UI_DIM, lineBg);
+      gfx.setCursor(stampX, y);
+      String stamp = line.stampShort;
+      if (stamp.length() > 5) stamp = stamp.substring(0, 5);
+      gfx.print(stamp);
+    }
+
+    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    drawWrappedStyledText(textX, y, line.raw, textW, lineBg, skipRows, rowsToDraw);
+    return rowsToDraw;
   }
 
   void drawNickPane(const Tab& tab) {
@@ -3595,6 +4288,102 @@ class IrcClientApp {
           emitChar(c);
           break;
       }
+    }
+  }
+
+  void drawWrappedStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int skipRows = 0, int maxRows = 1) {
+    auto& gfx = drawTarget();
+    TextStyle st;
+    st.fg = UI_FG;
+    st.bg = baseBg;
+    int cx = x;
+    int row = 0;
+    int charsPerRow = std::max(1, maxWidth / CHAR_W);
+    int col = 0;
+
+    auto advanceRow = [&]() {
+      ++row;
+      cx = x;
+      col = 0;
+    };
+
+    auto emitChar = [&](char out) {
+      if (col >= charsPerRow) advanceRow();
+      if (row >= skipRows && row < skipRows + maxRows) {
+        int drawY = y + (row - skipRows) * ROW_H;
+        uint16_t fg = st.reverse ? st.bg : st.fg;
+        uint16_t bg = st.reverse ? st.fg : st.bg;
+        gfx.fillRect(cx, drawY, CHAR_W, CHAR_H + 1, bg);
+        gfx.setTextColor(fg, bg);
+        gfx.setCursor(cx, drawY);
+        gfx.print(out);
+        if (st.underline) {
+          gfx.drawFastHLine(cx, drawY + CHAR_H, CHAR_W, fg);
+        }
+        if (st.bold && cx + 1 < x + maxWidth) {
+          gfx.setCursor(cx + 1, drawY);
+          gfx.print(out);
+        }
+      }
+      cx += CHAR_W;
+      ++col;
+    };
+
+    for (size_t i = 0; i < raw.length(); ++i) {
+      char c = raw[i];
+      switch (c) {
+        case 0x02:
+          st.bold = !st.bold;
+          break;
+        case 0x03: {
+          int j = static_cast<int>(i) + 1;
+          String a, b;
+          while (j < static_cast<int>(raw.length()) && a.length() < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+            a += raw[j++];
+          }
+          if (j < static_cast<int>(raw.length()) && raw[j] == ',') {
+            ++j;
+            while (j < static_cast<int>(raw.length()) && b.length() < 2 && isdigit(static_cast<unsigned char>(raw[j]))) {
+              b += raw[j++];
+            }
+          }
+          if (_cfg.colorMode == ColorMode::Full || _cfg.colorMode == ColorMode::Safe) {
+            if (a.isEmpty()) {
+              st.fg = UI_FG;
+              st.bg = baseBg;
+            } else {
+              st.fg = ircColorTo565(a.toInt());
+              if (_cfg.colorMode == ColorMode::Full && !b.isEmpty()) st.bg = ircColorTo565(b.toInt());
+              if (_cfg.colorMode == ColorMode::Safe) st.bg = baseBg;
+            }
+          } else {
+            st.fg = UI_FG;
+            st.bg = baseBg;
+          }
+          i = j - 1;
+          break;
+        }
+        case 0x0F:
+          st = TextStyle();
+          st.fg = UI_FG;
+          st.bg = baseBg;
+          break;
+        case 0x16:
+          st.reverse = !st.reverse;
+          break;
+        case 0x1D:
+          break;
+        case 0x1F:
+          st.underline = !st.underline;
+          break;
+        case '\n':
+          advanceRow();
+          break;
+        default:
+          emitChar(c);
+          break;
+      }
+      if (row >= skipRows + maxRows) break;
     }
   }
 };

@@ -11,6 +11,7 @@ Current release: `v0.2`
 - Configurable screen timeout directly from the on-device config menu
 - Configurable screen brightness from `0` to `10` in the config menu
 - Chat scroll shortcuts with `Fn + ; . , /` to read older messages while new ones arrive
+- Configurable chat text overflow mode: default marquee or alternative line wrap
 
 - RFC-style IRC registration flow (`PASS`, `NICK`, `USER`)
 - Direct TLS support with `WiFiClientSecure`
@@ -19,6 +20,7 @@ Current release: `v0.2`
   - SOCKS5
   - HTTP CONNECT
 - Generic BNC / ZNC-style `PASS` composition
+- Soju bouncer mode with `soju.im/bouncer-networks` support
 - CAP negotiation (`CAP LS 302`, `CAP REQ`, `CAP END`)
 - IRCv3 support for:
   - `message-tags`
@@ -85,8 +87,11 @@ proxy_pass=
 
 # Generic BNC / ZNC-style PASS generation
 bnc_enabled=false
+bnc_mode=generic
 bnc_user=
 bnc_network=
+bnc_client=
+soju_bind_netid=
 bnc_pass=
 
 # SASL PLAIN
@@ -100,6 +105,7 @@ nick_pane_enabled=true
 color_mode=full
 show_control_glyphs=true
 persist_tabs=true
+text_overflow=marquee
 screen_timeout_sec=10
 screen_brightness=10
 reconnect_initial_ms=3000
@@ -135,6 +141,7 @@ That file is written automatically when tab state or UI preferences change.
 
 - `/join #chan[,#chan2]`
 - `/part [#chan] [reason]`
+- `/detach [#chan]`
 - `/nick newnick`
 - `/msg target text`
 - `/notice target text`
@@ -165,6 +172,8 @@ That file is written automatically when tab state or UI preferences change.
 - `/quote RAW IRC LINE`
 - `/raw RAW IRC LINE`
 - `/config`
+- `/soju [status|networks|cached|add|change|del|bind]`
+- `/bouncer ...`
 - `/reconnect`
 - `/quit`
 
@@ -197,10 +206,13 @@ The log timestamp uses IRCv3 `server-time` when the server provides it, otherwis
 
 - TLS through proxy is still **not** implemented in this build.
 - SASL is implemented for the `PLAIN` mechanism only.
+- `bnc_mode=soju` enables soju-specific auth handling, optional `bnc_client`, pre-registration bind via `soju_bind_netid`, and `BOUNCER` network management commands.
+- `/soju add` and `/soju change` expect attributes in IRC message-tag style, e.g. `host=irc.libera.chat;tls=1;name=Libera`.
 - The two-row input area improves local editing of long lines, but outbound messages are still sent as standard single-line IRC messages.
 - The color filter only affects on-screen rendering; the log file always stores plain text without IRC formatting bytes.
 - `screen_timeout_sec=0` disables automatic screen sleep.
 - `screen_brightness` accepts values from `0` (off) to `10` (max).
+- `text_overflow=marquee` keeps horizontal marquee scrolling, while `text_overflow=wrap` wraps long chat lines onto multiple rows.
 
 
 ## Config page controls
