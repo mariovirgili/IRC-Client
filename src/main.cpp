@@ -11,6 +11,8 @@
 #include <cctype>
 #include <cstring>
 #include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 static constexpr int SD_SCK = 40;
 static constexpr int SD_MISO = 39;
@@ -62,13 +64,20 @@ static constexpr uint32_t KEYBOARD_ACTION_DEBOUNCE_MS = 120;
 static constexpr size_t MAX_PENDING_SD_LOG_LINES = 192;
 static constexpr size_t SD_LOG_FLUSH_MAX_LINES = 16;
 static constexpr uint32_t SD_LOG_FLUSH_TIME_BUDGET_US = 2500;
+static constexpr size_t MAX_IRC_COMMAND_QUEUE_ITEMS = 96;
+static constexpr size_t MAX_UI_EVENT_QUEUE_ITEMS = 192;
+static constexpr size_t MAX_UI_RAW_BATCH_LINES = 24;
+static constexpr size_t UI_EVENT_PROCESS_BUDGET_PER_LOOP = 32;
+static constexpr int IRC_TASK_STACK_SIZE = 12288;
+static constexpr UBaseType_t IRC_TASK_PRIORITY = 1;
+static constexpr BaseType_t IRC_TASK_CORE = 0;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
 static constexpr const char* METRICS_LOG_PATH = "/serialLog.txt";
 static constexpr const char* DEFAULT_WIFI_SSID = "YOUR_WIFI";
 static constexpr const char* APP_NAME = "Cardputer IRC";
-static constexpr const char* APP_VERSION = "0.3";
+static constexpr const char* APP_VERSION = "0.4";
 static constexpr uint16_t DEFAULT_SCREEN_TIMEOUT_SEC = 10;
 static constexpr uint8_t DEFAULT_SCREEN_BRIGHTNESS = 10;
 
@@ -270,6 +279,8 @@ struct ChannelListMetric {
   bool active = false;
   uint32_t startedAtMs = 0;
   String requestLine;
+  size_t entries = 0;
+  bool truncated = false;
 };
 
 struct ChannelJoinMetric {
@@ -303,6 +314,46 @@ struct PendingSdLogLine {
 struct LogPathCacheEntry {
   String tabFolder;
   String path;
+};
+
+enum class IrcCommandType {
+  ApplyConfig,
+  SyncKnownChannels,
+  SendRaw,
+  JoinBatch,
+  RequestChannelList,
+  Reconnect,
+  Quit,
+  SojuAction
+};
+
+struct IrcCommand {
+  IrcCommandType type = IrcCommandType::SendRaw;
+  Config config;
+  std::vector<String> channels;
+  String line;
+  String reason;
+  String source;
+  bool reconnect = false;
+};
+
+enum class UiEventType {
+  StatusLine,
+  MetricsLine,
+  NetState,
+  SelfNickChanged,
+  SessionReset,
+  RawLines
+};
+
+struct UiEvent {
+  UiEventType type = UiEventType::StatusLine;
+  String text;
+  String text2;
+  bool b1 = false;
+  bool b2 = false;
+  bool b3 = false;
+  std::vector<String> lines;
 };
 
 struct Tab {
@@ -585,11 +636,17 @@ class IrcClientApp {
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
     initFrameBuffer();
     showBootTitle();
+    _ircCommandMutex = xSemaphoreCreateMutex();
+    _uiEventMutex = xSemaphoreCreateMutex();
 
     initSD();
     loadConfig();
-    metricsLog(String(APP_NAME) + " metrics ready: bouncer=" +
-      (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
+    _ircCfg = _cfg;
+    _selfNick = _cfg.nick;
+    _ircSelfNick = _cfg.nick;
+    _currentReconnectDelayMs = _cfg.reconnectInitialMs;
+    writeMetricsLogLine(formatMetricsLogLine(String(APP_NAME) + " metrics ready: bouncer=" +
+      (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled"))));
     applyConfiguredDisplaySettings();
     refreshBatteryStatus(true);
     _lastUserActivityMs = millis();
@@ -599,20 +656,19 @@ class IrcClientApp {
     if (wifiNeedsSetup(_cfg)) {
       logStatus("Wi-Fi not configured, opening config");
       openConfigPage(CFG_WIFI_SSID);
-    } else {
-      connectWiFi();
     }
+    startIrcTask();
+    if (!syncKnownChannelsToIrc()) logCommandQueueFailure("known channel sync");
+    if (!queueApplyConfig(_cfg, false)) logCommandQueueFailure("initial config");
   }
 
   void loop() {
     M5Cardputer.update();
+    serviceUiEvents();
     serviceButtons();
     if (_configOpen) handleConfigKeyboard();
     else if (_channelListOpen) handleChannelListKeyboard();
     else handleKeyboard();
-    serviceWiFi();
-    serviceIRC();
-    serviceBncChannelAttachMetric();
     serviceStateSave();
     serviceSdLogFlush();
     serviceTextScroll();
@@ -626,6 +682,7 @@ class IrcClientApp {
 
  private:
   Config _cfg;
+  Config _ircCfg;
   M5Canvas _frameBuffer;
   bool _useFrameBuffer = false;
   SimpleTransport _transport;
@@ -634,10 +691,15 @@ class IrcClientApp {
   String _input;
   String _rxBuffer;
   String _selfNick;
+  String _ircSelfNick;
   bool _wifiReady = false;
+  bool _uiWifiReady = false;
+  String _uiLocalIp;
   bool _sdReady = false;
   bool _dirty = true;
   bool _ircRegistered = false;
+  bool _uiTransportConnected = false;
+  bool _uiIrcRegistered = false;
   bool _awaitingPong = false;
   String _lastPingToken;
   uint32_t _lastPingMs = 0;
@@ -680,6 +742,7 @@ class IrcClientApp {
   bool _saslInProgress = false;
   bool _saslCompleted = false;
   bool _saslWaitingForChallenge = false;
+  std::vector<String> _knownChannels;
 
   String _desiredActiveTabName;
   bool _stateDirty = false;
@@ -714,8 +777,14 @@ class IrcClientApp {
   int _channelListScroll = 0;
 
   String _chanTypes = "#&";
+  String _ircChanTypes = "#&";
   String _prefixSymbols = "~&@%+";
   String _prefixModes = "qaohv";
+  TaskHandle_t _ircTaskHandle = nullptr;
+  SemaphoreHandle_t _ircCommandMutex = nullptr;
+  SemaphoreHandle_t _uiEventMutex = nullptr;
+  std::deque<IrcCommand> _ircCommandQueue;
+  std::deque<UiEvent> _uiEventQueue;
 
   static String trimCopy(String s) {
     s.trim();
@@ -818,26 +887,313 @@ class IrcClientApp {
     return String(buf);
   }
 
-  void metricsLog(const String& message) {
-    if (!_cfg.serialLogEnabled) return;
-    if (!_sdReady) return;
+  static bool lockQueueMutex(SemaphoreHandle_t mutex, TickType_t waitTicks = pdMS_TO_TICKS(5)) {
+    return mutex && xSemaphoreTake(mutex, waitTicks) == pdTRUE;
+  }
 
+  static void unlockQueueMutex(SemaphoreHandle_t mutex) {
+    if (mutex) xSemaphoreGive(mutex);
+  }
+
+  static bool isDroppableUiEventType(UiEventType type) {
+    return type == UiEventType::StatusLine || type == UiEventType::MetricsLine || type == UiEventType::RawLines;
+  }
+
+  static bool isCriticalUiEventType(UiEventType type) {
+    return type == UiEventType::NetState || type == UiEventType::SelfNickChanged || type == UiEventType::SessionReset;
+  }
+
+  void logCommandQueueFailure(const String& action) {
+    logStatus("Internal queue full: " + action + " not sent");
+  }
+
+  String formatMetricsLogLine(const String& message) const {
+    return "[+" + formatSeconds(millis()) + "s] " + message;
+  }
+
+  void writeMetricsLogLine(const String& line) {
+    if (!_cfg.serialLogEnabled || !_sdReady) return;
     File f = SD.open(METRICS_LOG_PATH, FILE_APPEND);
     if (!f) f = SD.open(METRICS_LOG_PATH, FILE_WRITE);
     if (!f) return;
-
-    f.println("[+" + formatSeconds(millis()) + "s] " + message);
+    f.println(line);
     f.close();
+  }
+
+  bool enqueueIrcCommand(IrcCommand&& cmd) {
+    if (!lockQueueMutex(_ircCommandMutex)) return false;
+    if (_ircCommandQueue.size() >= MAX_IRC_COMMAND_QUEUE_ITEMS) {
+      unlockQueueMutex(_ircCommandMutex);
+      return false;
+    }
+    _ircCommandQueue.push_back(std::move(cmd));
+    unlockQueueMutex(_ircCommandMutex);
+    return true;
+  }
+
+  bool tryPopIrcCommand(IrcCommand& cmd) {
+    if (!lockQueueMutex(_ircCommandMutex, 0)) return false;
+    if (_ircCommandQueue.empty()) {
+      unlockQueueMutex(_ircCommandMutex);
+      return false;
+    }
+    cmd = std::move(_ircCommandQueue.front());
+    _ircCommandQueue.pop_front();
+    unlockQueueMutex(_ircCommandMutex);
+    return true;
+  }
+
+  bool enqueueUiEvent(UiEvent&& evt) {
+    if (!lockQueueMutex(_uiEventMutex)) return false;
+
+    if (evt.type == UiEventType::NetState && !_uiEventQueue.empty() && _uiEventQueue.back().type == UiEventType::NetState) {
+      _uiEventQueue.back() = std::move(evt);
+      unlockQueueMutex(_uiEventMutex);
+      return true;
+    }
+
+    if (evt.type == UiEventType::RawLines &&
+        !_uiEventQueue.empty() &&
+        _uiEventQueue.back().type == UiEventType::RawLines &&
+        _uiEventQueue.back().text == evt.text &&
+        !_uiEventQueue.back().lines.empty() &&
+        _uiEventQueue.back().lines.size() < MAX_UI_RAW_BATCH_LINES &&
+        !evt.lines.empty()) {
+      for (const String& line : evt.lines) {
+        if (_uiEventQueue.back().lines.size() >= MAX_UI_RAW_BATCH_LINES) break;
+        _uiEventQueue.back().lines.push_back(line);
+      }
+      unlockQueueMutex(_uiEventMutex);
+      return true;
+    }
+
+    if (_uiEventQueue.size() >= MAX_UI_EVENT_QUEUE_ITEMS && isCriticalUiEventType(evt.type)) {
+      for (auto it = _uiEventQueue.begin(); it != _uiEventQueue.end(); ++it) {
+        if (isDroppableUiEventType(it->type)) {
+          _uiEventQueue.erase(it);
+          break;
+        }
+      }
+    }
+
+    if (_uiEventQueue.size() >= MAX_UI_EVENT_QUEUE_ITEMS) {
+      unlockQueueMutex(_uiEventMutex);
+      return false;
+    }
+    _uiEventQueue.push_back(std::move(evt));
+    unlockQueueMutex(_uiEventMutex);
+    return true;
+  }
+
+  bool tryPopUiEvent(UiEvent& evt) {
+    if (!lockQueueMutex(_uiEventMutex, 0)) return false;
+    if (_uiEventQueue.empty()) {
+      unlockQueueMutex(_uiEventMutex);
+      return false;
+    }
+    evt = std::move(_uiEventQueue.front());
+    _uiEventQueue.pop_front();
+    unlockQueueMutex(_uiEventMutex);
+    return true;
+  }
+
+  void emitStatusEvent(const String& message) {
+    UiEvent evt;
+    evt.type = UiEventType::StatusLine;
+    evt.text = "*** " + message;
+    enqueueUiEvent(std::move(evt));
+  }
+
+  void emitMetricsEvent(const String& message) {
+    if (!_ircCfg.serialLogEnabled) return;
+    UiEvent evt;
+    evt.type = UiEventType::MetricsLine;
+    evt.text = formatMetricsLogLine(message);
+    enqueueUiEvent(std::move(evt));
+  }
+
+  void emitNetStateEvent() {
+    UiEvent evt;
+    evt.type = UiEventType::NetState;
+    evt.text = _wifiReady ? WiFi.localIP().toString() : "";
+    evt.b1 = _wifiReady;
+    evt.b2 = _transport.connected();
+    evt.b3 = _ircRegistered;
+    enqueueUiEvent(std::move(evt));
+  }
+
+  void emitSelfNickChanged(const String& nick) {
+    UiEvent evt;
+    evt.type = UiEventType::SelfNickChanged;
+    evt.text = nick;
+    enqueueUiEvent(std::move(evt));
+  }
+
+  void emitSessionResetEvent() {
+    UiEvent evt;
+    evt.type = UiEventType::SessionReset;
+    enqueueUiEvent(std::move(evt));
+    emitNetStateEvent();
+  }
+
+  void enqueueUiRawLine(const String& command, const String& raw) {
+    UiEvent evt;
+    evt.type = UiEventType::RawLines;
+    evt.text = command;
+    evt.lines.push_back(raw);
+    enqueueUiEvent(std::move(evt));
+  }
+
+  void metricsLog(const String& message) {
+    emitMetricsEvent(message);
+  }
+
+  std::vector<String> collectKnownChannelTabs() const {
+    std::vector<String> channels;
+    for (const Tab& tab : _tabs) {
+      if (tab.type != TabType::Channel) continue;
+      bool exists = false;
+      for (const String& existing : channels) {
+        if (equalsIgnoreCase(existing, tab.name)) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) channels.push_back(tab.name);
+    }
+    return channels;
+  }
+
+  bool syncKnownChannelsToIrc() {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::SyncKnownChannels;
+    cmd.channels = collectKnownChannelTabs();
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueApplyConfig(const Config& cfg, bool reconnect) {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::ApplyConfig;
+    cmd.config = cfg;
+    cmd.reconnect = reconnect;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueRawCommand(const String& line) {
+    if (line.isEmpty()) return false;
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::SendRaw;
+    cmd.line = line;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueJoinBatch(const std::vector<String>& channels, const String& source) {
+    if (channels.empty()) return false;
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::JoinBatch;
+    cmd.channels = channels;
+    cmd.source = source;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueChannelListRequest(const String& filter) {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::RequestChannelList;
+    cmd.reason = filter;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueReconnectCommand(const String& reason) {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::Reconnect;
+    cmd.reason = reason;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueQuitCommand() {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::Quit;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  bool queueSojuAction(const String& args) {
+    IrcCommand cmd;
+    cmd.type = IrcCommandType::SojuAction;
+    cmd.line = args;
+    return enqueueIrcCommand(std::move(cmd));
+  }
+
+  void applyUiEvent(const UiEvent& evt) {
+    switch (evt.type) {
+      case UiEventType::StatusLine:
+        appendLine(statusTab(), evt.text);
+        break;
+      case UiEventType::MetricsLine:
+        writeMetricsLogLine(evt.text);
+        break;
+      case UiEventType::NetState:
+        _uiWifiReady = evt.b1;
+        _uiTransportConnected = evt.b2;
+        _uiIrcRegistered = evt.b3;
+        _uiLocalIp = evt.text;
+        _dirty = true;
+        break;
+      case UiEventType::SelfNickChanged:
+        _selfNick = evt.text;
+        _cfg.nick = evt.text;
+        _dirty = true;
+        break;
+      case UiEventType::SessionReset:
+        _uiTransportConnected = false;
+        _uiIrcRegistered = false;
+        _channelListLoading = false;
+        _channelList.clear();
+        _channelListSelected = 0;
+        _channelListScroll = 0;
+        _channelListTruncated = false;
+        _channelListOpen = false;
+        _channelListFilterPrompt = false;
+        _dirty = true;
+        break;
+      case UiEventType::RawLines:
+        for (const String& raw : evt.lines) handleUiRawLine(raw);
+        break;
+    }
+  }
+
+  void serviceUiEvents() {
+    UiEvent evt;
+    size_t processed = 0;
+    while (processed < UI_EVENT_PROCESS_BUDGET_PER_LOOP && tryPopUiEvent(evt)) {
+      applyUiEvent(evt);
+      ++processed;
+    }
+  }
+
+  static void ircTaskEntry(void* arg) {
+    static_cast<IrcClientApp*>(arg)->ircTaskLoop();
+  }
+
+  void startIrcTask() {
+    if (_ircTaskHandle) return;
+    xTaskCreatePinnedToCore(ircTaskEntry, "ircTask", IRC_TASK_STACK_SIZE, this, IRC_TASK_PRIORITY, &_ircTaskHandle, IRC_TASK_CORE);
+  }
+
+  void ircTaskLoop() {
+    for (;;) {
+      serviceIrcCommands();
+      serviceWiFi();
+      serviceIRC();
+      serviceBncChannelAttachMetric();
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
   }
 
   void finishChannelListMetric() {
     if (!_channelListMetric.active) return;
     uint32_t elapsedMs = millis() - _channelListMetric.startedAtMs;
-    String message = "Channel list download finished: entries=" + String(_channelList.size());
-    if (!_channelListFilter.isEmpty()) {
-      message += ", filter_matches=" + String(filteredChannelListIndices().size());
-    }
-    if (_channelListTruncated) message += ", truncated=true";
+    String message = "Channel list download finished: entries=" + String(_channelListMetric.entries);
+    if (_channelListMetric.truncated) message += ", truncated=true";
     message += ", duration=" + formatSeconds(elapsedMs) + " seconds";
     metricsLog(message);
     _channelListMetric = ChannelListMetric();
@@ -846,7 +1202,7 @@ class IrcClientApp {
   void abortChannelListMetric(const String& reason) {
     if (!_channelListMetric.active) return;
     uint32_t elapsedMs = millis() - _channelListMetric.startedAtMs;
-    metricsLog("Channel list download aborted: entries=" + String(_channelList.size()) +
+    metricsLog("Channel list download aborted: entries=" + String(_channelListMetric.entries) +
       ", duration=" + formatSeconds(elapsedMs) + " seconds, reason=" + reason);
     _channelListMetric = ChannelListMetric();
   }
@@ -856,6 +1212,8 @@ class IrcClientApp {
     _channelListMetric.active = true;
     _channelListMetric.startedAtMs = millis();
     _channelListMetric.requestLine = requestLine;
+    _channelListMetric.entries = 0;
+    _channelListMetric.truncated = false;
     metricsLog("Channel list download started: request=\"" + requestLine + "\"");
   }
 
@@ -937,22 +1295,20 @@ class IrcClientApp {
     std::vector<String> channels;
     auto addUnique = [&](const String& rawChannel) {
       String channel = trimCopy(rawChannel);
-      if (channel.isEmpty() || !isChannelName(channel)) return;
+      if (channel.isEmpty() || !isRuntimeChannelName(channel)) return;
       for (const String& existing : channels) {
         if (equalsIgnoreCase(existing, channel)) return;
       }
       channels.push_back(channel);
     };
 
-    for (const String& channel : _cfg.autoJoin) addUnique(channel);
-    for (const Tab& tab : _tabs) {
-      if (tab.type == TabType::Channel) addUnique(tab.name);
-    }
+    for (const String& channel : _ircCfg.autoJoin) addUnique(channel);
+    for (const String& channel : _knownChannels) addUnique(channel);
     return channels;
   }
 
   void beginBncChannelAttachMetric(const String& source) {
-    if (!_cfg.bncEnabled) return;
+    if (!_ircCfg.bncEnabled) return;
     _bncChannelAttachArmed = true;
     if (_bncChannelAttachMetric.active) return;
 
@@ -985,7 +1341,7 @@ class IrcClientApp {
   }
 
   void noteBncObservedChannel(const String& channel, const String& eventType) {
-    if (!_cfg.bncEnabled || !_ircRegistered || channel.isEmpty() || !isChannelName(channel)) return;
+    if (!_ircCfg.bncEnabled || !_ircRegistered || channel.isEmpty() || !isRuntimeChannelName(channel)) return;
     if (_channelJoinMetric.active) return;
     if (!_bncChannelAttachMetric.active && !_bncChannelAttachArmed) return;
 
@@ -1308,6 +1664,10 @@ class IrcClientApp {
 
   bool isChannelName(const String& s) const {
     return !s.isEmpty() && _chanTypes.indexOf(s[0]) >= 0;
+  }
+
+  bool isRuntimeChannelName(const String& s) const {
+    return !s.isEmpty() && _ircChanTypes.indexOf(s[0]) >= 0;
   }
 
   static const IrcServerPreset* findServerPresetById(const String& presetId) {
@@ -1783,7 +2143,7 @@ class IrcClientApp {
   }
 
   void openChannelListPage(bool refresh = true) {
-    if (!_transport.connected() || !_ircRegistered) {
+    if (!_uiTransportConnected || !_uiIrcRegistered) {
       logStatus("Channel list requires an IRC connection");
       return;
     }
@@ -1797,7 +2157,7 @@ class IrcClientApp {
   }
 
   void startChannelListSearch(const String& filter, bool refresh = true) {
-    if (!_transport.connected() || !_ircRegistered) {
+    if (!_uiTransportConnected || !_uiIrcRegistered) {
       logStatus("Channel list requires an IRC connection");
       return;
     }
@@ -1841,14 +2201,16 @@ class IrcClientApp {
   }
 
   void requestChannelList() {
-    if (!_transport.connected() || !_ircRegistered) return;
+    if (!_uiTransportConnected || !_uiIrcRegistered) return;
     _channelListLoading = true;
     _channelListTruncated = false;
     _channelList.clear();
     _channelListSelected = 0;
     _channelListScroll = 0;
-    beginChannelListMetric(_channelListFilter.isEmpty() ? "LIST" : "LIST (filter=\"" + _channelListFilter + "\")");
-    sendRaw("LIST");
+    if (!queueChannelListRequest(_channelListFilter)) {
+      _channelListLoading = false;
+      logCommandQueueFailure("channel list request");
+    }
     _dirty = true;
   }
 
@@ -1902,7 +2264,6 @@ class IrcClientApp {
     if (!_channelListFilter.isEmpty()) msg += ", filter matches " + String(filteredCount);
     if (_channelListTruncated) msg += " (truncated)";
     logStatus(msg);
-    finishChannelListMetric();
     _dirty = true;
   }
 
@@ -1912,8 +2273,10 @@ class IrcClientApp {
     if (_channelListSelected < 0 || _channelListSelected >= static_cast<int>(visible.size())) return;
     const ChannelListEntry& entry = _channelList[visible[_channelListSelected]];
     if (entry.name.isEmpty()) return;
-    beginChannelJoinMetric({entry.name}, "channel-list");
-    sendRaw("JOIN " + entry.name);
+    if (!queueJoinBatch({entry.name}, "channel-list")) {
+      logCommandQueueFailure("channel join");
+      return;
+    }
     Tab& tab = getOrCreateTab(entry.name, TabType::Channel);
     _activeTab = static_cast<int>(&tab - &_tabs[0]);
     tab.unread = false;
@@ -2211,17 +2574,17 @@ class IrcClientApp {
         }
         _cfg = _editCfg;
         _selfNick = _cfg.nick;
-        _currentReconnectDelayMs = _cfg.reconnectInitialMs;
         applyConfiguredDisplaySettings();
         if (_cfg.screenTimeoutSec == 0) wakeDisplay();
         _lastUserActivityMs = millis();
-        WiFi.disconnect();
-        _wifiReady = false;
-        _nextWifiAttemptAt = 0;
+        _uiWifiReady = false;
+        _uiTransportConnected = false;
+        _uiIrcRegistered = false;
         markStateDirty();
+        if (!syncKnownChannelsToIrc()) logCommandQueueFailure("known channel sync");
+        if (!queueApplyConfig(_cfg, true)) logCommandQueueFailure("config apply");
         closeConfigPage();
         logStatus("Config saved to SD");
-        scheduleReconnect("Reconnect after config save");
         return;
       case CFG_EXIT_DISCARD:
         closeConfigPage();
@@ -2436,62 +2799,127 @@ class IrcClientApp {
     _stateDirty = false;
   }
 
+  void serviceIrcCommands() {
+    IrcCommand cmd;
+    while (tryPopIrcCommand(cmd)) {
+      switch (cmd.type) {
+        case IrcCommandType::ApplyConfig:
+          _ircCfg = cmd.config;
+          _ircSelfNick = _ircCfg.nick;
+          _currentReconnectDelayMs = _ircCfg.reconnectInitialMs;
+          if (cmd.reconnect) {
+            scheduleReconnect("Reconnect after config save");
+          } else {
+            _nextWifiAttemptAt = 0;
+            _nextIrcReconnectAt = 0;
+          }
+          break;
+        case IrcCommandType::SyncKnownChannels:
+          _knownChannels = cmd.channels;
+          break;
+        case IrcCommandType::SendRaw:
+          ircSendRaw(cmd.line);
+          break;
+        case IrcCommandType::JoinBatch: {
+          if (cmd.channels.empty()) break;
+          beginChannelJoinMetric(cmd.channels, cmd.source.isEmpty() ? "manual" : cmd.source);
+          std::vector<String> joined;
+          for (const String& channel : cmd.channels) {
+            String c = trimCopy(channel);
+            if (c.isEmpty()) continue;
+            bool exists = false;
+            for (const String& known : _knownChannels) {
+              if (equalsIgnoreCase(known, c)) {
+                exists = true;
+                break;
+              }
+            }
+            if (!exists) _knownChannels.push_back(c);
+            joined.push_back(c);
+          }
+          if (!joined.empty()) ircSendRaw("JOIN " + joinStrings(joined, ","));
+          break;
+        }
+        case IrcCommandType::RequestChannelList:
+          if (_transport.connected() && _ircRegistered) {
+            beginChannelListMetric(cmd.reason.isEmpty() ? "LIST" : "LIST (filter=\"" + cmd.reason + "\")");
+            ircSendRaw("LIST");
+          } else {
+            emitStatusEvent("Channel list requires an IRC connection");
+          }
+          break;
+        case IrcCommandType::Reconnect:
+          scheduleReconnect(cmd.reason.isEmpty() ? String("Manual reconnect") : cmd.reason);
+          break;
+        case IrcCommandType::Quit:
+          ircSendRaw("QUIT :Bye from Cardputer");
+          _transport.close();
+          _ircRegistered = false;
+          emitSessionResetEvent();
+          break;
+        case IrcCommandType::SojuAction:
+          handleSojuCommand(cmd.line);
+          break;
+      }
+    }
+  }
+
   void connectWiFi() {
-    if (wifiNeedsSetup(_cfg)) {
-      logStatus("Wi-Fi SSID missing or placeholder");
+    if (wifiNeedsSetup(_ircCfg)) {
+      emitStatusEvent("Wi-Fi SSID missing or placeholder");
       return;
     }
 
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    WiFi.begin(_cfg.wifiSSID.c_str(), _cfg.wifiPass.c_str());
+    WiFi.begin(_ircCfg.wifiSSID.c_str(), _ircCfg.wifiPass.c_str());
 
     uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(100);
-      M5Cardputer.update();
-      drawSplash("Connecting Wi-Fi", _cfg.wifiSSID, String((millis() - start) / 1000) + "s");
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     _wifiReady = WiFi.status() == WL_CONNECTED;
     if (_wifiReady) {
       configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      logStatus("Wi-Fi connected: " + WiFi.localIP().toString());
+      emitStatusEvent("Wi-Fi connected: " + WiFi.localIP().toString());
       _nextWifiAttemptAt = 0;
     } else {
-      logStatus("Wi-Fi connect timeout");
+      emitStatusEvent("Wi-Fi connect timeout");
     }
+    emitNetStateEvent();
   }
 
   void serviceWiFi() {
-    if (wifiNeedsSetup(_cfg)) return;
+    if (wifiNeedsSetup(_ircCfg)) return;
     if (WiFi.status() == WL_CONNECTED) {
-      _wifiReady = true;
+      if (!_wifiReady) {
+        _wifiReady = true;
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        emitStatusEvent("Wi-Fi connected: " + WiFi.localIP().toString());
+        emitNetStateEvent();
+      }
       return;
     }
 
+    bool wasReady = _wifiReady;
     _wifiReady = false;
+    if (wasReady) emitNetStateEvent();
     if (millis() < _nextWifiAttemptAt) return;
 
     _nextWifiAttemptAt = millis() + 5000;
     WiFi.disconnect();
-    WiFi.begin(_cfg.wifiSSID.c_str(), _cfg.wifiPass.c_str());
-    logStatus("Wi-Fi reconnect...");
+    WiFi.begin(_ircCfg.wifiSSID.c_str(), _ircCfg.wifiPass.c_str());
+    emitStatusEvent("Wi-Fi reconnect...");
   }
 
   void scheduleReconnect(const String& reason) {
-    if (!reason.isEmpty()) logStatus(reason);
+    if (!reason.isEmpty()) emitStatusEvent(reason);
     abortChannelListMetric(reason.isEmpty() ? String("reconnect") : reason);
     abortChannelJoinMetric(reason.isEmpty() ? String("reconnect") : reason);
     abortBncChannelAttachMetric(reason.isEmpty() ? String("reconnect") : reason);
     abortPingMetric(reason.isEmpty() ? String("reconnect") : reason);
     _transport.close();
-    _channelListLoading = false;
-    _channelList.clear();
-    _channelListSelected = 0;
-    _channelListScroll = 0;
-    _channelListTruncated = false;
-    _channelListOpen = false;
     _ircRegistered = false;
     _awaitingPong = false;
     _capNegotiationDone = false;
@@ -2510,16 +2938,17 @@ class IrcClientApp {
     _saslCompleted = false;
     _saslWaitingForChallenge = false;
     _nextIrcReconnectAt = millis() + _currentReconnectDelayMs;
-    _currentReconnectDelayMs = std::min(_currentReconnectDelayMs * 2U, _cfg.reconnectMaxMs);
+    _currentReconnectDelayMs = std::min(_currentReconnectDelayMs * 2U, _ircCfg.reconnectMaxMs);
+    emitSessionResetEvent();
   }
 
   void resetReconnectBackoff() {
-    _currentReconnectDelayMs = _cfg.reconnectInitialMs;
+    _currentReconnectDelayMs = _ircCfg.reconnectInitialMs;
     _nextIrcReconnectAt = 0;
   }
 
   void serviceIRC() {
-    if (!_wifiReady || _cfg.endpointHost.isEmpty()) return;
+    if (!_wifiReady || _ircCfg.endpointHost.isEmpty()) return;
 
     bool nowConnected = _transport.connected();
     if (_previousTransportState && !nowConnected) {
@@ -2532,15 +2961,15 @@ class IrcClientApp {
       if (millis() < _nextIrcReconnectAt) return;
 
       String error;
-      logStatus("Connecting IRC...");
+      emitStatusEvent("Connecting IRC...");
       uint32_t connectStartedAtMs = millis();
       metricsLog("IRC session configuration: bouncer=" +
-        (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
-      metricsLog("IRC transport connection started: host=" + _cfg.endpointHost +
-        ", port=" + String(_cfg.endpointPort) +
-        ", tls=" + String(_cfg.useTLS ? "true" : "false"));
-      if (_transport.connect(_cfg, error)) {
-        metricsLog("IRC transport connection finished: host=" + _cfg.endpointHost +
+        (_ircCfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_ircCfg.bncMode) : String("disabled")));
+      metricsLog("IRC transport connection started: host=" + _ircCfg.endpointHost +
+        ", port=" + String(_ircCfg.endpointPort) +
+        ", tls=" + String(_ircCfg.useTLS ? "true" : "false"));
+      if (_transport.connect(_ircCfg, error)) {
+        metricsLog("IRC transport connection finished: host=" + _ircCfg.endpointHost +
           ", duration=" + formatSeconds(millis() - connectStartedAtMs) + " seconds");
         _previousTransportState = true;
         _lastRxMs = millis();
@@ -2561,9 +2990,10 @@ class IrcClientApp {
         _saslCompleted = false;
         _saslWaitingForChallenge = false;
         performRegistration();
-        logStatus("IRC transport connected");
+        emitStatusEvent("IRC transport connected");
+        emitNetStateEvent();
       } else {
-        metricsLog("IRC transport connection failed: host=" + _cfg.endpointHost +
+        metricsLog("IRC transport connection failed: host=" + _ircCfg.endpointHost +
           ", duration=" + formatSeconds(millis() - connectStartedAtMs) + " seconds, error=" + error);
         scheduleReconnect("Connect failed: " + error);
       }
@@ -2595,10 +3025,10 @@ class IrcClientApp {
     if (!_awaitingPong && millis() - _lastRxMs > PING_INTERVAL_MS) {
       _lastPingToken = String(millis());
       beginPingMetric(_lastPingToken);
-      sendRawNoEcho("PING :" + _lastPingToken);
+      ircSendRawNoEcho("PING :" + _lastPingToken);
       _lastPingMs = millis();
       _awaitingPong = true;
-      appendLine(statusTab(), "*** Ping -> " + _lastPingToken);
+      emitStatusEvent("Ping -> " + _lastPingToken);
     }
 
     if (_awaitingPong && millis() - _lastPingMs > PONG_TIMEOUT_MS) {
@@ -2608,76 +3038,88 @@ class IrcClientApp {
 
   void performRegistration() {
     String passLine = buildPassLine();
-    if (!passLine.isEmpty()) sendRawNoEcho("PASS " + passLine);
-    sendRawNoEcho("CAP LS 302");
-    sendRawNoEcho("NICK " + _cfg.nick);
-    sendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _cfg.realname);
+    if (!passLine.isEmpty()) ircSendRawNoEcho("PASS " + passLine);
+    ircSendRawNoEcho("CAP LS 302");
+    ircSendRawNoEcho("NICK " + _ircCfg.nick);
+    ircSendRawNoEcho("USER " + buildRegistrationUsername() + " 0 * :" + _ircCfg.realname);
   }
 
   String buildSojuIdentity(const String& overrideUser = "") const {
     String user = trimCopy(overrideUser);
-    if (user.isEmpty()) user = _cfg.bncUser;
+    if (user.isEmpty()) user = _ircCfg.bncUser;
     if (user.isEmpty()) return user;
 
     bool hasNetwork = user.indexOf('/') >= 0;
     bool hasClient = user.indexOf('@') >= 0;
-    if (!hasNetwork && !_cfg.bncNetwork.isEmpty()) {
-      user += "/" + _cfg.bncNetwork;
+    if (!hasNetwork && !_ircCfg.bncNetwork.isEmpty()) {
+      user += "/" + _ircCfg.bncNetwork;
     }
-    if (!hasClient && !_cfg.bncClient.isEmpty()) {
-      user += "@" + _cfg.bncClient;
+    if (!hasClient && !_ircCfg.bncClient.isEmpty()) {
+      user += "@" + _ircCfg.bncClient;
     }
     return user;
   }
 
   String buildRegistrationUsername() const {
-    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
+    if (_ircCfg.bncEnabled && _ircCfg.bncMode == BouncerMode::Soju) {
       String user = buildSojuIdentity();
       if (!user.isEmpty()) return user;
     }
-    return _cfg.username;
+    return _ircCfg.username;
   }
 
   String buildPassLine() const {
-    if (!_cfg.serverPass.isEmpty()) return _cfg.serverPass;
-    if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) {
-      if (_cfg.bncMode == BouncerMode::Soju) {
-        return _cfg.saslEnabled ? "" : _cfg.bncPass;
+    if (!_ircCfg.serverPass.isEmpty()) return _ircCfg.serverPass;
+    if (_ircCfg.bncEnabled && !_ircCfg.bncPass.isEmpty()) {
+      if (_ircCfg.bncMode == BouncerMode::Soju) {
+        return _ircCfg.saslEnabled ? "" : _ircCfg.bncPass;
       }
-      String left = _cfg.bncUser;
-      if (!_cfg.bncNetwork.isEmpty()) left += "/" + _cfg.bncNetwork;
-      if (!left.isEmpty()) return left + ":" + _cfg.bncPass;
-      return _cfg.bncPass;
+      String left = _ircCfg.bncUser;
+      if (!_ircCfg.bncNetwork.isEmpty()) left += "/" + _ircCfg.bncNetwork;
+      if (!left.isEmpty()) return left + ":" + _ircCfg.bncPass;
+      return _ircCfg.bncPass;
     }
     return "";
   }
 
   String buildSaslUser() const {
-    if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju) {
-      String explicitUser = trimCopy(_cfg.saslUser);
+    if (_ircCfg.bncEnabled && _ircCfg.bncMode == BouncerMode::Soju) {
+      String explicitUser = trimCopy(_ircCfg.saslUser);
       if (!explicitUser.isEmpty()) return buildSojuIdentity(explicitUser);
       String user = buildSojuIdentity();
       if (!user.isEmpty()) return user;
     }
-    if (!_cfg.saslUser.isEmpty()) return _cfg.saslUser;
-    if (_cfg.bncEnabled && !_cfg.bncUser.isEmpty()) return _cfg.bncUser;
-    return _cfg.nick;
+    if (!_ircCfg.saslUser.isEmpty()) return _ircCfg.saslUser;
+    if (_ircCfg.bncEnabled && !_ircCfg.bncUser.isEmpty()) return _ircCfg.bncUser;
+    return _ircCfg.nick;
   }
 
   String buildSaslPass() const {
-    if (!_cfg.saslPass.isEmpty()) return _cfg.saslPass;
-    if (_cfg.bncEnabled && !_cfg.bncPass.isEmpty()) return _cfg.bncPass;
+    if (!_ircCfg.saslPass.isEmpty()) return _ircCfg.saslPass;
+    if (_ircCfg.bncEnabled && !_ircCfg.bncPass.isEmpty()) return _ircCfg.bncPass;
     return "";
   }
 
-  void sendRawNoEcho(const String& line) {
+  void ircSendRawNoEcho(const String& line) {
+    if (!_transport.connected()) return;
+    _transport.write(line + "\r\n");
+  }
+
+  void ircSendRaw(const String& line) {
     if (!_transport.connected()) return;
     _transport.write(line + "\r\n");
   }
 
   void sendRaw(const String& line) {
-    if (!_transport.connected()) return;
-    _transport.write(line + "\r\n");
+    if (line.isEmpty()) return;
+    if (!_uiTransportConnected) {
+      logStatus("IRC is not connected");
+      return;
+    }
+    if (!queueRawCommand(line)) {
+      logCommandQueueFailure("IRC command");
+      return;
+    }
     appendLine(statusTab(), "--> " + line, currentTimeStampShort(), currentTimeStampLong());
   }
 
@@ -2840,12 +3282,12 @@ class IrcClientApp {
 
   void appendSojuNetworksToStatus() {
     if (_sojuNetworks.empty()) {
-      appendLine(statusTab(), "*** soju networks: none");
+      emitStatusEvent("soju networks: none");
       return;
     }
-    appendLine(statusTab(), "*** soju networks: " + String(_sojuNetworks.size()));
+    emitStatusEvent("soju networks: " + String(_sojuNetworks.size()));
     for (const SojuNetwork& network : _sojuNetworks) {
-      appendLine(statusTab(), "*** " + summarizeSojuNetwork(network));
+      emitStatusEvent(summarizeSojuNetwork(network));
     }
   }
 
@@ -2870,15 +3312,15 @@ class IrcClientApp {
 
     if (msg.command == "PING") {
       String payload = msg.params.empty() ? "cardputer" : msg.params.back();
-      sendRawNoEcho("PONG :" + payload);
-      appendLine(statusTab(), "*** Ping <- " + payload, messageStampShort(msg), messageStampLog(msg));
+      ircSendRawNoEcho("PONG :" + payload);
+      emitStatusEvent("Ping <- " + payload);
       return;
     }
 
     if (msg.command == "PONG") {
       _awaitingPong = false;
       finishPingMetric(msg.params.empty() ? _lastPingToken : msg.params.back());
-      appendLine(statusTab(), "*** Pong " + (msg.params.empty() ? "" : msg.params.back()), messageStampShort(msg), messageStampLog(msg));
+      emitStatusEvent("Pong " + (msg.params.empty() ? "" : msg.params.back()));
       return;
     }
 
@@ -2909,29 +3351,42 @@ class IrcClientApp {
 
     if (msg.command == "001") {
       _ircRegistered = true;
-      _selfNick = _cfg.nick;
+      _ircSelfNick = _ircCfg.nick;
+      emitSelfNickChanged(_ircSelfNick);
       resetReconnectBackoff();
-      appendLine(statusTab(), "*** Registered on IRC", messageStampShort(msg), messageStampLog(msg));
+      emitStatusEvent("Registered on IRC");
+      emitNetStateEvent();
       beginBncChannelAttachMetric("post-registration");
       if (capEnabled("soju.im/bouncer-networks") && !capEnabled("soju.im/bouncer-networks-notify")) {
-        sendRawNoEcho("BOUNCER LISTNETWORKS");
+        ircSendRawNoEcho("BOUNCER LISTNETWORKS");
       }
       autoJoinRestoredChannels();
       return;
     }
 
     if (msg.command == "005") {
-      handleISupport(msg);
+      for (size_t i = 1; i + 1 < msg.params.size(); ++i) {
+        String token = msg.params[i];
+        if (token.startsWith("CHANTYPES=")) {
+          _ircChanTypes = token.substring(strlen("CHANTYPES="));
+        }
+        if (token.startsWith("BOUNCER_NETID")) {
+          int eq = token.indexOf('=');
+          _sojuBoundNetId = eq >= 0 ? token.substring(eq + 1) : "";
+        }
+      }
+      enqueueUiRawLine(msg.command, raw);
       return;
     }
 
     noteBncObservedChannelFromMessage(msg);
 
     if (msg.command == "433") {
-      _cfg.nick += "_";
-      _selfNick = _cfg.nick;
-      sendRaw("NICK " + _cfg.nick);
-      appendLine(statusTab(), "*** Nick in use, retrying as " + _cfg.nick, messageStampShort(msg), messageStampLog(msg));
+      _ircCfg.nick += "_";
+      _ircSelfNick = _ircCfg.nick;
+      emitSelfNickChanged(_ircSelfNick);
+      ircSendRaw("NICK " + _ircCfg.nick);
+      emitStatusEvent("Nick in use, retrying as " + _ircCfg.nick);
       return;
     }
 
@@ -2939,10 +3394,10 @@ class IrcClientApp {
       _saslCompleted = true;
       _saslInProgress = false;
       _saslWaitingForChallenge = false;
-      appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
+      enqueueUiRawLine(msg.command, raw);
       if (!_capNegotiationDone) {
         maybeSendSojuBind();
-        sendRaw("CAP END");
+        ircSendRaw("CAP END");
         _capNegotiationDone = true;
       }
       return;
@@ -2951,11 +3406,100 @@ class IrcClientApp {
     if (msg.command == "904" || msg.command == "905" || msg.command == "906" || msg.command == "907") {
       _saslInProgress = false;
       _saslWaitingForChallenge = false;
-      appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
+      enqueueUiRawLine(msg.command, raw);
       if (!_capNegotiationDone) {
-        sendRaw("CAP END");
+        ircSendRaw("CAP END");
         _capNegotiationDone = true;
       }
+      return;
+    }
+
+    if (msg.command == "TAGMSG") {
+      // Ignore TAGMSG in the UI to avoid flooding from typing/activity tags.
+      return;
+    }
+    if (msg.command == "JOIN" && !msg.params.empty()) {
+      String nick = nickFromPrefix(msg.prefix);
+      String channel = msg.params[0];
+      if (equalsIgnoreCase(nick, _ircSelfNick)) {
+        noteJoinedChannel(channel);
+        bool exists = false;
+        for (const String& known : _knownChannels) {
+          if (equalsIgnoreCase(known, channel)) {
+            exists = true;
+            break;
+          }
+        }
+        if (!exists) _knownChannels.push_back(channel);
+      }
+      enqueueUiRawLine(msg.command, raw);
+      return;
+    }
+    if (msg.command == "PART" && !msg.params.empty()) {
+      String nick = nickFromPrefix(msg.prefix);
+      if (equalsIgnoreCase(nick, _ircSelfNick)) {
+        String channel = msg.params[0];
+        for (size_t i = 0; i < _knownChannels.size(); ++i) {
+          if (equalsIgnoreCase(_knownChannels[i], channel)) {
+            _knownChannels.erase(_knownChannels.begin() + i);
+            break;
+          }
+        }
+      }
+      enqueueUiRawLine(msg.command, raw);
+      return;
+    }
+    if (msg.command == "NICK" && !msg.params.empty()) {
+      String oldNick = nickFromPrefix(msg.prefix);
+      if (equalsIgnoreCase(oldNick, _ircSelfNick)) {
+        _ircSelfNick = msg.params[0];
+        _ircCfg.nick = _ircSelfNick;
+        emitSelfNickChanged(_ircSelfNick);
+      }
+      enqueueUiRawLine(msg.command, raw);
+      return;
+    }
+    if (msg.command == "321") {
+      _channelListMetric.entries = 0;
+      _channelListMetric.truncated = false;
+      enqueueUiRawLine(msg.command, raw);
+      return;
+    }
+    if (msg.command == "322") {
+      if (_channelListMetric.active) {
+        if (_channelListMetric.entries < MAX_CHANNEL_LIST_ENTRIES) ++_channelListMetric.entries;
+        else _channelListMetric.truncated = true;
+      }
+      enqueueUiRawLine(msg.command, raw);
+      return;
+    }
+    if (msg.command == "323") {
+      enqueueUiRawLine(msg.command, raw);
+      finishChannelListMetric();
+      return;
+    }
+
+    enqueueUiRawLine(msg.command, raw);
+  }
+
+  void handleUiRawLine(const String& raw) {
+    IrcMessage msg = parseMessage(raw);
+
+    if (msg.command == "001") {
+      appendLine(statusTab(), "*** Registered on IRC", messageStampShort(msg), messageStampLog(msg));
+      return;
+    }
+
+    if (msg.command == "005") {
+      handleISupport(msg);
+      appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
+      return;
+    }
+
+    if (msg.command == "900" || msg.command == "903" ||
+        msg.command == "904" || msg.command == "905" ||
+        msg.command == "906" || msg.command == "907") {
+      appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
       return;
     }
 
@@ -3055,7 +3599,7 @@ class IrcClientApp {
         appendSojuNetworksToStatus();
         _sojuListRequested = false;
       } else {
-        appendLine(statusTab(), "*** soju networks synced: " + String(_sojuNetworks.size()));
+        emitStatusEvent("soju networks synced: " + String(_sojuNetworks.size()));
       }
     }
   }
@@ -3068,7 +3612,7 @@ class IrcClientApp {
 
     if (msg.params.size() >= 3 && msg.params[2] == "*") {
       removeSojuNetworkById(list, netId);
-      if (!inBatch) appendLine(statusTab(), "*** soju network removed: [" + netId + "]");
+      if (!inBatch) emitStatusEvent("soju network removed: [" + netId + "]");
       if (_sojuBoundNetId == netId) _sojuBoundNetId = "";
       return;
     }
@@ -3076,8 +3620,8 @@ class IrcClientApp {
     String attrs = msg.params.size() >= 3 ? msg.params[2] : "";
     SojuNetwork& network = ensureSojuNetwork(list, netId);
     applySojuNetworkAttributes(network, attrs);
-    if (!inBatch) appendLine(statusTab(), "*** soju network: " + summarizeSojuNetwork(network));
-    if (!inBatch && _cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju &&
+    if (!inBatch) emitStatusEvent("soju network: " + summarizeSojuNetwork(network));
+    if (!inBatch && _ircCfg.bncEnabled && _ircCfg.bncMode == BouncerMode::Soju &&
         equalsIgnoreCase(network.state, "connected")) {
       beginBncChannelAttachMetric("soju-network-connected");
     }
@@ -3093,61 +3637,59 @@ class IrcClientApp {
       return;
     }
     if (sub == "ADDNETWORK" && msg.params.size() >= 2) {
-      appendLine(statusTab(), "*** soju addnetwork ok: [" + msg.params[1] + "]");
+      emitStatusEvent("soju addnetwork ok: [" + msg.params[1] + "]");
       return;
     }
     if (sub == "CHANGENETWORK" && msg.params.size() >= 2) {
-      appendLine(statusTab(), "*** soju changenetwork ok: [" + msg.params[1] + "]");
+      emitStatusEvent("soju changenetwork ok: [" + msg.params[1] + "]");
       return;
     }
     if (sub == "DELNETWORK" && msg.params.size() >= 2) {
-      appendLine(statusTab(), "*** soju delnetwork ok: [" + msg.params[1] + "]");
+      emitStatusEvent("soju delnetwork ok: [" + msg.params[1] + "]");
       return;
     }
     if (sub == "BIND" && msg.params.size() >= 2) {
       _sojuBoundNetId = msg.params[1];
       _sojuBindSent = true;
-      appendLine(statusTab(), "*** soju bound network: [" + _sojuBoundNetId + "]");
+      emitStatusEvent("soju bound network: [" + _sojuBoundNetId + "]");
       return;
     }
 
-    appendLine(statusTab(), "*** BOUNCER " + joinStrings(msg.params, " "));
+    emitStatusEvent("BOUNCER " + joinStrings(msg.params, " "));
   }
 
   void handleFail(const IrcMessage& msg) {
     if (msg.params.empty()) {
-      appendLine(statusTab(), "*** FAIL");
+      emitStatusEvent("FAIL");
       return;
     }
     if (equalsIgnoreCase(msg.params[0], "BOUNCER")) {
-      String line = "*** BOUNCER FAIL";
+      String line = "BOUNCER FAIL";
       for (const String& param : msg.params) line += " " + param;
-      appendLine(statusTab(), line);
+      emitStatusEvent(line);
       return;
     }
-    appendLine(statusTab(), "*** FAIL " + joinStrings(msg.params, " "));
+    emitStatusEvent("FAIL " + joinStrings(msg.params, " "));
   }
 
   void autoJoinRestoredChannels() {
     std::vector<String> joined;
-    for (const String& c : _cfg.autoJoin) {
+    for (const String& c : _ircCfg.autoJoin) {
       if (!c.isEmpty()) joined.push_back(c);
     }
-    for (size_t i = 1; i < _tabs.size(); ++i) {
-      if (_tabs[i].type == TabType::Channel) {
-        bool exists = false;
-        for (const String& c : joined) {
-          if (equalsIgnoreCase(c, _tabs[i].name)) {
-            exists = true;
-            break;
-          }
+    for (const String& known : _knownChannels) {
+      bool exists = false;
+      for (const String& c : joined) {
+        if (equalsIgnoreCase(c, known)) {
+          exists = true;
+          break;
         }
-        if (!exists) joined.push_back(_tabs[i].name);
       }
+      if (!exists) joined.push_back(known);
     }
     beginChannelJoinMetric(joined, "autojoin");
     for (const String& c : joined) {
-      sendRaw("JOIN " + c);
+      ircSendRaw("JOIN " + c);
     }
   }
 
@@ -3191,17 +3733,17 @@ class IrcClientApp {
   }
 
   void maybeSendSojuBind() {
-    if (!_cfg.bncEnabled || _cfg.bncMode != BouncerMode::Soju) return;
+    if (!_ircCfg.bncEnabled || _ircCfg.bncMode != BouncerMode::Soju) return;
     if (_sojuBindSent || _ircRegistered) return;
     if (!capEnabled("soju.im/bouncer-networks")) return;
 
-    String netId = trimCopy(_cfg.sojuBindNetId);
+    String netId = trimCopy(_ircCfg.sojuBindNetId);
     if (netId.isEmpty()) return;
 
-    bool waitingOnSasl = capEnabled("sasl") && _cfg.saslEnabled && !_saslCompleted;
+    bool waitingOnSasl = capEnabled("sasl") && _ircCfg.saslEnabled && !_saslCompleted;
     if (waitingOnSasl) return;
 
-    sendRaw("BOUNCER BIND " + netId);
+    ircSendRaw("BOUNCER BIND " + netId);
     _sojuBindSent = true;
   }
 
@@ -3226,8 +3768,8 @@ class IrcClientApp {
       if (serverSupportsCap("multi-prefix")) want.push_back("multi-prefix");
       if (serverSupportsCap("server-time")) want.push_back("server-time");
       if (serverSupportsCap("message-tags")) want.push_back("message-tags");
-      if (_cfg.saslEnabled && serverSupportsCap("sasl")) want.push_back("sasl");
-      if (_cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju && serverSupportsCap("soju.im/bouncer-networks")) {
+      if (_ircCfg.saslEnabled && serverSupportsCap("sasl")) want.push_back("sasl");
+      if (_ircCfg.bncEnabled && _ircCfg.bncMode == BouncerMode::Soju && serverSupportsCap("soju.im/bouncer-networks")) {
         want.push_back("soju.im/bouncer-networks");
         if (serverSupportsCap("soju.im/bouncer-networks-notify")) {
           want.push_back("soju.im/bouncer-networks-notify");
@@ -3235,10 +3777,10 @@ class IrcClientApp {
       }
 
       if (!want.empty() && (sub == "NEW" || !_capRequestSent)) {
-        sendRaw("CAP REQ :" + joinStrings(want, " "));
+        ircSendRaw("CAP REQ :" + joinStrings(want, " "));
         _capRequestSent = true;
       } else if (!_capNegotiationDone && !_saslInProgress) {
-        sendRaw("CAP END");
+        ircSendRaw("CAP END");
         _capNegotiationDone = true;
       }
       return;
@@ -3259,22 +3801,22 @@ class IrcClientApp {
         if (equalsIgnoreCase(name, "sasl") && !disable) saslAck = true;
       }
 
-      if (saslAck && _cfg.saslEnabled && !_saslCompleted && !_saslInProgress) {
+      if (saslAck && _ircCfg.saslEnabled && !_saslCompleted && !_saslInProgress) {
         _saslInProgress = true;
         _saslWaitingForChallenge = true;
-        sendRaw("AUTHENTICATE PLAIN");
+        ircSendRaw("AUTHENTICATE PLAIN");
       } else if (!_capNegotiationDone && !_saslInProgress) {
         maybeSendSojuBind();
-        sendRaw("CAP END");
+        ircSendRaw("CAP END");
         _capNegotiationDone = true;
       }
       return;
     }
 
     if (sub == "NAK") {
-      appendLine(statusTab(), "*** CAP NAK: " + msg.params.back(), messageStampShort(msg), messageStampLog(msg));
+      emitStatusEvent("CAP NAK: " + msg.params.back());
       if (!_capNegotiationDone && !_saslInProgress) {
-        sendRaw("CAP END");
+        ircSendRaw("CAP END");
         _capNegotiationDone = true;
       }
       return;
@@ -3285,7 +3827,7 @@ class IrcClientApp {
       for (const String& cap : delCaps) {
         setEnabledCap(normalizeCapName(cap), false);
       }
-      appendLine(statusTab(), "*** CAP DEL: " + msg.params.back(), messageStampShort(msg), messageStampLog(msg));
+      emitStatusEvent("CAP DEL: " + msg.params.back());
       return;
     }
   }
@@ -3340,17 +3882,17 @@ class IrcClientApp {
     String encoded = base64EncodeBytes(payload.data(), payload.size());
     const int chunkSize = 400;
     for (int i = 0; i < static_cast<int>(encoded.length()); i += chunkSize) {
-      sendRaw("AUTHENTICATE " + encoded.substring(i, i + chunkSize));
+      ircSendRaw("AUTHENTICATE " + encoded.substring(i, i + chunkSize));
     }
     if (encoded.length() % chunkSize == 0) {
-      sendRaw("AUTHENTICATE +");
+      ircSendRaw("AUTHENTICATE +");
     }
     _saslWaitingForChallenge = false;
   }
 
   void handleAuthenticate(const IrcMessage& msg) {
     if (!_saslInProgress || msg.params.empty()) return;
-    if (equalsIgnoreCase(_cfg.saslMechanism, "PLAIN") && msg.params[0] == "+") {
+    if (equalsIgnoreCase(_ircCfg.saslMechanism, "PLAIN") && msg.params[0] == "+") {
       sendSaslPlainPayload();
     }
   }
@@ -3368,12 +3910,8 @@ class IrcClientApp {
           _prefixModes = token.substring(lp + 1, rp);
           _prefixSymbols = token.substring(rp + 1);
         }
-      } else if (token.startsWith("BOUNCER_NETID")) {
-        int eq = token.indexOf('=');
-        _sojuBoundNetId = eq >= 0 ? token.substring(eq + 1) : "";
       }
     }
-    appendLine(statusTab(), formatNumeric(msg), messageStampShort(msg), messageStampLog(msg));
   }
 
   String formatNumeric(const IrcMessage& msg) {
@@ -3606,7 +4144,6 @@ class IrcClientApp {
 
     Tab& tab = getOrCreateTab(channel, TabType::Channel);
     if (equalsIgnoreCase(nick, _selfNick)) {
-      noteJoinedChannel(channel);
       appendLine(tab, "*** Joined " + channel, messageStampShort(msg), messageStampLog(msg));
       tab.unread = false;
       tab.mention = false;
@@ -3959,6 +4496,10 @@ class IrcClientApp {
       appendLine(statusTab(), "*** No channel/query active. Use /join or /query.");
       return;
     }
+    if (!_uiTransportConnected) {
+      logStatus("IRC is not connected");
+      return;
+    }
 
     sendPrivmsg(tab.name, text);
     appendLine(tab, "<" + _selfNick + "> " + text, currentTimeStampShort(), currentTimeStampLong(), false, true, false);
@@ -3967,8 +4508,12 @@ class IrcClientApp {
 
   void closeActiveTab() {
     if (_activeTab <= 0 || _activeTab >= static_cast<int>(_tabs.size())) return;
-    if (_tabs[_activeTab].type == TabType::Channel) {
-      sendRaw("PART " + _tabs[_activeTab].name + " :Closing tab");
+    if (_tabs[_activeTab].type == TabType::Channel && _uiTransportConnected) {
+      if (!queueRawCommand("PART " + _tabs[_activeTab].name + " :Closing tab")) {
+        logCommandQueueFailure("channel part");
+      } else {
+        appendLine(statusTab(), "--> PART " + _tabs[_activeTab].name + " :Closing tab", currentTimeStampShort(), currentTimeStampLong());
+      }
     }
     _tabs.erase(_tabs.begin() + _activeTab);
     if (_activeTab >= static_cast<int>(_tabs.size())) _activeTab = static_cast<int>(_tabs.size()) - 1;
@@ -3976,6 +4521,7 @@ class IrcClientApp {
     _tabs[_activeTab].unread = false;
     _tabs[_activeTab].mention = false;
     _dirty = true;
+    if (!syncKnownChannelsToIrc()) logCommandQueueFailure("known channel sync");
     markStateDirty();
   }
 
@@ -4003,12 +4549,12 @@ class IrcClientApp {
   }
 
   bool ensureSojuCommandReady(bool requireCap = true) {
-    if (!_cfg.bncEnabled || _cfg.bncMode != BouncerMode::Soju) {
-      appendLine(statusTab(), "*** Soju mode is not enabled");
+    if (!_ircCfg.bncEnabled || _ircCfg.bncMode != BouncerMode::Soju) {
+      emitStatusEvent("Soju mode is not enabled");
       return false;
     }
     if (requireCap && !capEnabled("soju.im/bouncer-networks")) {
-      appendLine(statusTab(), "*** soju.im/bouncer-networks is not active on this connection");
+      emitStatusEvent("soju.im/bouncer-networks is not active on this connection");
       return false;
     }
     return true;
@@ -4026,18 +4572,18 @@ class IrcClientApp {
     sub.toLowerCase();
 
     if (sub.isEmpty() || sub == "status") {
-      appendLine(statusTab(), "*** soju mode=" + bouncerModeToString(_cfg.bncMode) +
+      emitStatusEvent("soju mode=" + bouncerModeToString(_ircCfg.bncMode) +
         " cap=" + String(capEnabled("soju.im/bouncer-networks") ? "on" : "off") +
         " notify=" + String(capEnabled("soju.im/bouncer-networks-notify") ? "on" : "off"));
-      appendLine(statusTab(), "*** soju bound=" + (_sojuBoundNetId.isEmpty() ? String("(none)") : _sojuBoundNetId) +
-        " config_bind=" + (_cfg.sojuBindNetId.isEmpty() ? String("(none)") : _cfg.sojuBindNetId));
+      emitStatusEvent("soju bound=" + (_sojuBoundNetId.isEmpty() ? String("(none)") : _sojuBoundNetId) +
+        " config_bind=" + (_ircCfg.sojuBindNetId.isEmpty() ? String("(none)") : _ircCfg.sojuBindNetId));
       return;
     }
 
     if (sub == "networks" || sub == "list") {
       if (!ensureSojuCommandReady()) return;
       _sojuListRequested = true;
-      sendRaw("BOUNCER LISTNETWORKS");
+      ircSendRaw("BOUNCER LISTNETWORKS");
       return;
     }
 
@@ -4049,10 +4595,10 @@ class IrcClientApp {
     if (sub == "add") {
       if (!ensureSojuCommandReady()) return;
       if (rest.isEmpty()) {
-        appendLine(statusTab(), "*** Usage: /soju add name=...;host=...");
+        emitStatusEvent("Usage: /soju add name=...;host=...");
         return;
       }
-      sendRaw("BOUNCER ADDNETWORK " + rest);
+      ircSendRaw("BOUNCER ADDNETWORK " + rest);
       return;
     }
 
@@ -4060,44 +4606,44 @@ class IrcClientApp {
       if (!ensureSojuCommandReady()) return;
       int argSp = rest.indexOf(' ');
       if (argSp <= 0) {
-        appendLine(statusTab(), "*** Usage: /soju change <netid> key=value;...");
+        emitStatusEvent("Usage: /soju change <netid> key=value;...");
         return;
       }
       String netId = trimCopy(rest.substring(0, argSp));
       String attrs = trimCopy(rest.substring(argSp + 1));
       if (attrs.isEmpty()) {
-        appendLine(statusTab(), "*** Usage: /soju change <netid> key=value;...");
+        emitStatusEvent("Usage: /soju change <netid> key=value;...");
         return;
       }
-      sendRaw("BOUNCER CHANGENETWORK " + netId + " " + attrs);
+      ircSendRaw("BOUNCER CHANGENETWORK " + netId + " " + attrs);
       return;
     }
 
     if (sub == "del" || sub == "delete" || sub == "rm") {
       if (!ensureSojuCommandReady()) return;
       if (rest.isEmpty()) {
-        appendLine(statusTab(), "*** Usage: /soju del <netid>");
+        emitStatusEvent("Usage: /soju del <netid>");
         return;
       }
-      sendRaw("BOUNCER DELNETWORK " + rest);
+      ircSendRaw("BOUNCER DELNETWORK " + rest);
       return;
     }
 
     if (sub == "bind") {
       if (!ensureSojuCommandReady(false)) return;
       if (rest.isEmpty()) {
-        appendLine(statusTab(), "*** soju bind target = " + (_cfg.sojuBindNetId.isEmpty() ? String("(none)") : _cfg.sojuBindNetId));
+        emitStatusEvent("soju bind target = " + (_ircCfg.sojuBindNetId.isEmpty() ? String("(none)") : _ircCfg.sojuBindNetId));
         return;
       }
       if (rest == "off" || rest == "clear" || rest == "none") {
-        _cfg.sojuBindNetId = "";
+        _ircCfg.sojuBindNetId = "";
         _sojuBindSent = false;
-        appendLine(statusTab(), "*** Cleared soju bind target for next reconnect");
+        emitStatusEvent("Cleared soju bind target for next reconnect");
         return;
       }
-      _cfg.sojuBindNetId = rest;
+      _ircCfg.sojuBindNetId = rest;
       _sojuBindSent = false;
-      appendLine(statusTab(), "*** soju bind target set to [" + rest + "] for next reconnect");
+      emitStatusEvent("soju bind target set to [" + rest + "] for next reconnect");
       if (_ircRegistered) {
         scheduleReconnect("Reconnecting to bind soju network " + rest);
       } else {
@@ -4106,7 +4652,7 @@ class IrcClientApp {
       return;
     }
 
-    appendLine(statusTab(), "*** Unknown /soju action: " + sub);
+    emitStatusEvent("Unknown /soju action: " + sub);
   }
 
   void handleCommand(const String& cmdLine) {
@@ -4124,13 +4670,21 @@ class IrcClientApp {
 
     if (cmd == "join") {
       if (!args.isEmpty()) {
+        if (!_uiTransportConnected) {
+          logStatus("IRC is not connected");
+          return;
+        }
         String joinTargets = args;
         int keySep = joinTargets.indexOf(' ');
         if (keySep >= 0) joinTargets = joinTargets.substring(0, keySep);
-        beginChannelJoinMetric(splitCsv(joinTargets), "manual");
-        sendRaw("JOIN " + args);
+        if (!queueJoinBatch(splitCsv(joinTargets), "manual")) {
+          logCommandQueueFailure("channel join");
+          return;
+        }
+        appendLine(statusTab(), "--> JOIN " + joinTargets, currentTimeStampShort(), currentTimeStampLong());
         for (const String& ch : splitCsv(args)) getOrCreateTab(ch, TabType::Channel);
         markStateDirty();
+        if (!syncKnownChannelsToIrc()) logCommandQueueFailure("known channel sync");
       }
       return;
     }
@@ -4169,6 +4723,10 @@ class IrcClientApp {
     if (cmd == "msg") {
       int s = args.indexOf(' ');
       if (s > 0) {
+        if (!_uiTransportConnected) {
+          logStatus("IRC is not connected");
+          return;
+        }
         String target = trimCopy(args.substring(0, s));
         String text = trimCopy(args.substring(s + 1));
         sendPrivmsg(target, text);
@@ -4193,6 +4751,10 @@ class IrcClientApp {
     if (cmd == "me") {
       Tab& tab = _tabs[_activeTab];
       if ((tab.type == TabType::Channel || tab.type == TabType::Query) && !args.isEmpty()) {
+        if (!_uiTransportConnected) {
+          logStatus("IRC is not connected");
+          return;
+        }
         sendRaw("PRIVMSG " + tab.name + " :\001ACTION " + args + "\001");
         appendLine(tab, "* " + _selfNick + " " + args, currentTimeStampShort(), currentTimeStampLong(), false, true, false);
       }
@@ -4341,7 +4903,20 @@ class IrcClientApp {
     }
 
     if (cmd == "soju" || cmd == "bouncer") {
-      handleSojuCommand(args);
+      String sub;
+      String rest;
+      int argSp = args.indexOf(' ');
+      if (argSp < 0) sub = trimCopy(args);
+      else {
+        sub = trimCopy(args.substring(0, argSp));
+        rest = trimCopy(args.substring(argSp + 1));
+      }
+      sub.toLowerCase();
+      if (sub == "bind") {
+        if (rest == "off" || rest == "clear" || rest == "none") _cfg.sojuBindNetId = "";
+        else if (!rest.isEmpty()) _cfg.sojuBindNetId = rest;
+      }
+      if (!queueSojuAction(args)) logCommandQueueFailure("soju command");
       return;
     }
 
@@ -4351,14 +4926,18 @@ class IrcClientApp {
     }
 
     if (cmd == "reconnect") {
-      scheduleReconnect("Manual reconnect");
+      if (!queueReconnectCommand("Manual reconnect")) logCommandQueueFailure("reconnect");
       return;
     }
 
     if (cmd == "quit") {
-      sendRaw("QUIT :Bye from Cardputer");
-      _transport.close();
-      _ircRegistered = false;
+      if (!queueQuitCommand()) {
+        logCommandQueueFailure("quit");
+        return;
+      }
+      appendLine(statusTab(), "--> QUIT :Bye from Cardputer", currentTimeStampShort(), currentTimeStampLong());
+      _uiTransportConnected = false;
+      _uiIrcRegistered = false;
       return;
     }
 
@@ -4603,9 +5182,9 @@ class IrcClientApp {
     if (_tabs[_activeTab].mention) title = "!" + title;
     else if (_tabs[_activeTab].unread) title = "*" + title;
 
-    String net = _wifiReady ? WiFi.localIP().toString() : "offline";
-    if (_transport.connected()) net += " IRC";
-    if (!_ircRegistered && _transport.connected()) net += "*";
+    String net = _uiWifiReady ? (_uiLocalIp.isEmpty() ? String("online") : _uiLocalIp) : "offline";
+    if (_uiTransportConnected) net += " IRC";
+    if (!_uiIrcRegistered && _uiTransportConnected) net += "*";
 
     static constexpr int batteryBodyW = 18;
     static constexpr int batteryTipW = 2;

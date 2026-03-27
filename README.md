@@ -2,7 +2,21 @@
 
 This project targets the M5Stack Cardputer and implements a compact IRC client with:
 
-Current release: `v0.3`
+Current release: `v0.4`
+
+Status: `Highly Experimental!`
+
+## New in v0.4
+
+- Highly experimental dual-core branch
+- UI and IRC runtime split into separate tasks:
+  - UI task handles keyboard input, tabs, rendering, display, and SD writes
+  - IRC task handles Wi-Fi, transport, raw IRC parsing, ping/reconnect, and soju runtime
+- Queue-based communication between UI and IRC runtime instead of direct calls on the hot path
+- Event batching and coalescing for UI updates to reduce pressure during bursts of IRC traffic
+- Better isolation of reconnect/session reset state between transport logic and on-screen state
+- Extra queue hardening for critical state updates and safer behavior when queues fill up
+- Better synchronization of known channels between UI state and runtime state during joins, reconnects, and tab closes
 
 ## New in v0.3
 
@@ -212,6 +226,7 @@ The log timestamp uses IRCv3 `server-time` when the server provides it, otherwis
 
 ## Notes and limits
 
+- `v0.4` is currently a dual-core experimental branch and should be treated as unstable until more on-device testing is completed.
 - TLS through proxy is still **not** implemented in this build.
 - SASL is implemented for the `PLAIN` mechanism only.
 - `bnc_mode=soju` enables soju-specific auth handling, optional `bnc_client`, pre-registration bind via `soju_bind_netid`, and `BOUNCER` network management commands.
