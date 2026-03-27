@@ -2,16 +2,18 @@
 
 This project targets the M5Stack Cardputer and implements a compact IRC client with:
 
-Current release: `v0.2`
+Current release: `v0.3`
 
-## New in v0.2
+## New in v0.3
 
-- Graphical battery indicator centered in the top bar
-- Screen timeout after inactivity with automatic wake on input
-- Configurable screen timeout directly from the on-device config menu
-- Configurable screen brightness from `0` to `10` in the config menu
-- Chat scroll shortcuts with `Fn + ; . , /` to read older messages while new ones arrive
-- Configurable chat text overflow mode: default marquee or alternative line wrap
+- Optional chat text overflow mode: keep the default marquee or switch to line wrap from the config menu
+- Soju bouncer support, including `soju.im/bouncer-networks`, `soju.im/bouncer-networks-notify`, `BOUNCER` management commands, and `/detach`
+- English connection and session metrics log written to `/serialLog.txt` on the SD root
+- Filtered channel list flow: pressing `` ` `` first asks for a search string, and `/list <text>` applies the same substring filter
+- Per-tab IRC logs on SD are now optional and disabled by default with `channel_log_enabled=false`
+- Better responsiveness on busy servers and soju sessions through lighter IRC processing, lower input latency, and less expensive NAMES/log handling
+
+## Core features
 
 - RFC-style IRC registration flow (`PASS`, `NICK`, `USER`)
 - Direct TLS support with `WiFiClientSecure`
@@ -34,8 +36,9 @@ Current release: `v0.2`
 - Centered graphical battery indicator in the header
 - Idle screen timeout with automatic wake on activity
 - Configurable screen brightness from `0` to `10`
+- Configurable screen timeout directly from the on-device config menu
+- Chat scroll shortcuts with `Fn + ; . , /` to read older messages while new ones arrive
 - Persistent tab/session restore on SD
-- Per-tab daily logs on SD
 - IRC formatting support on screen:
   - bold
   - underline
@@ -106,6 +109,8 @@ color_mode=full
 show_control_glyphs=true
 persist_tabs=true
 text_overflow=marquee
+metrics_log_enabled=true
+channel_log_enabled=false
 screen_timeout_sec=10
 screen_brightness=10
 reconnect_initial_ms=3000
@@ -167,7 +172,7 @@ That file is written automatically when tab state or UI preferences change.
 - `/scroll bottom`
 - `/nicklist [on|off]`
 - `/away [reason]`
-- `/list [mask]`
+- `/list [search text]`
 - `/colormode full|safe|mono`
 - `/quote RAW IRC LINE`
 - `/raw RAW IRC LINE`
@@ -182,13 +187,16 @@ Typing plain text sends a `PRIVMSG` to the active channel or query tab.
 ## Controls
 
 - Press `` ` `` to open the server channel list and press it again to close it.
+- When opening the channel list, the client first asks for a search filter. Press `Enter` on an empty filter to download the full list, or type a substring to only show matching channels after the full `LIST` download completes.
 - In config and channel-list pages, use `;` for up and `.` for down.
 - In chat tabs, hold `Fn` and use `;` / `.` for line-by-line scroll and `,` / `/` for page scroll.
 - Press `Enter` on a channel-list item to join it immediately.
 
 ## Logging
 
-Logs are stored as:
+Per-tab IRC logs are disabled by default. Enable them with `channel_log_enabled=true`.
+
+When enabled, logs are stored as:
 
 `/IRC/<server>/<tab-folder>/YYYYMMDD.log`
 
@@ -213,6 +221,8 @@ The log timestamp uses IRCv3 `server-time` when the server provides it, otherwis
 - `screen_timeout_sec=0` disables automatic screen sleep.
 - `screen_brightness` accepts values from `0` (off) to `10` (max).
 - `text_overflow=marquee` keeps horizontal marquee scrolling, while `text_overflow=wrap` wraps long chat lines onto multiple rows.
+- `metrics_log_enabled=true` enables the English timing/metrics log in `/serialLog.txt` on the SD root. Set it to `false` to disable it.
+- `channel_log_enabled=false` keeps per-tab IRC logs on SD disabled by default. Set it to `true` to write logs under `log_root`.
 
 
 ## Config page controls

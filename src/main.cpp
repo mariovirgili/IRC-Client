@@ -5,6 +5,7 @@
 #include <M5Cardputer.h>
 #include <SD.h>
 #include <SPI.h>
+#include <deque>
 #include <vector>
 #include <algorithm>
 #include <cctype>
@@ -54,12 +55,20 @@ static constexpr uint32_t UI_REFRESH_MS = 50;
 static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
 static constexpr uint32_t TEXT_SCROLL_STEP_MS = 220;
 static constexpr uint32_t BATTERY_POLL_MS = 5000;
+static constexpr uint32_t BNC_CHANNEL_ATTACH_IDLE_MS = 5000;
+static constexpr size_t IRC_RX_BYTE_BUDGET_PER_LOOP = 4096;
+static constexpr size_t IRC_RX_LINE_BUDGET_PER_LOOP = 24;
+static constexpr uint32_t KEYBOARD_ACTION_DEBOUNCE_MS = 120;
+static constexpr size_t MAX_PENDING_SD_LOG_LINES = 192;
+static constexpr size_t SD_LOG_FLUSH_MAX_LINES = 16;
+static constexpr uint32_t SD_LOG_FLUSH_TIME_BUDGET_US = 2500;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
 static constexpr const char* STATE_PATH = "/irc/state.txt";
+static constexpr const char* METRICS_LOG_PATH = "/serialLog.txt";
 static constexpr const char* DEFAULT_WIFI_SSID = "YOUR_WIFI";
 static constexpr const char* APP_NAME = "Cardputer IRC";
-static constexpr const char* APP_VERSION = "0.2";
+static constexpr const char* APP_VERSION = "0.3";
 static constexpr uint16_t DEFAULT_SCREEN_TIMEOUT_SEC = 10;
 static constexpr uint8_t DEFAULT_SCREEN_BRIGHTNESS = 10;
 
@@ -127,6 +136,8 @@ enum ConfigFieldId {
   CFG_PERSIST_TABS,
   CFG_SHOW_CONTROL_GLYPHS,
   CFG_TEXT_OVERFLOW,
+  CFG_SERIAL_LOG,
+  CFG_CHANNEL_LOG,
   CFG_SCREEN_TIMEOUT,
   CFG_SCREEN_BRIGHTNESS,
   CFG_LOG_ROOT,
@@ -199,6 +210,8 @@ struct Config {
   bool showControlGlyphs = true;
   bool persistTabs = true;
   TextOverflowMode textOverflowMode = TextOverflowMode::Marquee;
+  bool serialLogEnabled = true;
+  bool channelLogEnabled = false;
   uint16_t screenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC;
   uint8_t screenBrightness = DEFAULT_SCREEN_BRIGHTNESS;
 
@@ -253,6 +266,45 @@ struct SojuNetwork {
   String error;
 };
 
+struct ChannelListMetric {
+  bool active = false;
+  uint32_t startedAtMs = 0;
+  String requestLine;
+};
+
+struct ChannelJoinMetric {
+  bool active = false;
+  uint32_t startedAtMs = 0;
+  size_t requestedCount = 0;
+  size_t joinedCount = 0;
+  std::vector<String> pendingChannels;
+};
+
+struct PingMetric {
+  bool active = false;
+  uint32_t startedAtMs = 0;
+  String token;
+};
+
+struct BncChannelAttachMetric {
+  bool active = false;
+  uint32_t startedAtMs = 0;
+  uint32_t lastEventAtMs = 0;
+  size_t expectedCount = 0;
+  String source;
+  std::vector<String> channels;
+};
+
+struct PendingSdLogLine {
+  String path;
+  String line;
+};
+
+struct LogPathCacheEntry {
+  String tabFolder;
+  String path;
+};
+
 struct Tab {
   String name;
   TabType type = TabType::Status;
@@ -261,6 +313,8 @@ struct Tab {
   String topic;
   bool unread = false;
   bool mention = false;
+  bool usersDirty = false;
+  bool namesBatchActive = false;
   int scroll = 0;
 };
 
@@ -534,6 +588,8 @@ class IrcClientApp {
 
     initSD();
     loadConfig();
+    metricsLog(String(APP_NAME) + " metrics ready: bouncer=" +
+      (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
     applyConfiguredDisplaySettings();
     refreshBatteryStatus(true);
     _lastUserActivityMs = millis();
@@ -556,7 +612,9 @@ class IrcClientApp {
     else handleKeyboard();
     serviceWiFi();
     serviceIRC();
+    serviceBncChannelAttachMetric();
     serviceStateSave();
+    serviceSdLogFlush();
     serviceTextScroll();
     refreshBatteryStatus();
     serviceDisplayTimeout();
@@ -594,7 +652,17 @@ class IrcClientApp {
   int32_t _batteryLevel = -1;
   m5::Power_Class::is_charging_t _batteryChargeState = m5::Power_Class::charge_unknown;
   uint32_t _lastUserActivityMs = 0;
+  uint32_t _lastEnterKeyMs = 0;
+  uint32_t _lastDeleteKeyMs = 0;
+  uint32_t _lastTabKeyMs = 0;
+  uint32_t _lastActionCharMs = 0;
+  char _lastActionChar = 0;
   bool _screenSleeping = false;
+  ChannelListMetric _channelListMetric;
+  ChannelJoinMetric _channelJoinMetric;
+  BncChannelAttachMetric _bncChannelAttachMetric;
+  bool _bncChannelAttachArmed = false;
+  PingMetric _pingMetric;
 
   bool _capNegotiationDone = false;
   bool _capRequestSent = false;
@@ -616,6 +684,12 @@ class IrcClientApp {
   String _desiredActiveTabName;
   bool _stateDirty = false;
   uint32_t _lastStateDirtyMs = 0;
+  std::deque<PendingSdLogLine> _pendingSdLogs;
+  std::vector<LogPathCacheEntry> _logPathCache;
+  String _cachedLogRoot;
+  String _cachedLogServerDir;
+  String _cachedLogServerKey;
+  String _cachedLogDate;
 
   bool _configOpen = false;
   bool _configEditing = false;
@@ -632,7 +706,10 @@ class IrcClientApp {
   bool _channelListOpen = false;
   bool _channelListLoading = false;
   bool _channelListTruncated = false;
+  bool _channelListFilterPrompt = false;
   std::vector<ChannelListEntry> _channelList;
+  String _channelListFilter;
+  String _channelListFilterBuffer;
   int _channelListSelected = 0;
   int _channelListScroll = 0;
 
@@ -735,6 +812,265 @@ class IrcClientApp {
     return v ? "on" : "off";
   }
 
+  static String formatSeconds(uint32_t elapsedMs) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.3f", static_cast<double>(elapsedMs) / 1000.0);
+    return String(buf);
+  }
+
+  void metricsLog(const String& message) {
+    if (!_cfg.serialLogEnabled) return;
+    if (!_sdReady) return;
+
+    File f = SD.open(METRICS_LOG_PATH, FILE_APPEND);
+    if (!f) f = SD.open(METRICS_LOG_PATH, FILE_WRITE);
+    if (!f) return;
+
+    f.println("[+" + formatSeconds(millis()) + "s] " + message);
+    f.close();
+  }
+
+  void finishChannelListMetric() {
+    if (!_channelListMetric.active) return;
+    uint32_t elapsedMs = millis() - _channelListMetric.startedAtMs;
+    String message = "Channel list download finished: entries=" + String(_channelList.size());
+    if (!_channelListFilter.isEmpty()) {
+      message += ", filter_matches=" + String(filteredChannelListIndices().size());
+    }
+    if (_channelListTruncated) message += ", truncated=true";
+    message += ", duration=" + formatSeconds(elapsedMs) + " seconds";
+    metricsLog(message);
+    _channelListMetric = ChannelListMetric();
+  }
+
+  void abortChannelListMetric(const String& reason) {
+    if (!_channelListMetric.active) return;
+    uint32_t elapsedMs = millis() - _channelListMetric.startedAtMs;
+    metricsLog("Channel list download aborted: entries=" + String(_channelList.size()) +
+      ", duration=" + formatSeconds(elapsedMs) + " seconds, reason=" + reason);
+    _channelListMetric = ChannelListMetric();
+  }
+
+  void beginChannelListMetric(const String& requestLine) {
+    abortChannelListMetric("restarted");
+    _channelListMetric.active = true;
+    _channelListMetric.startedAtMs = millis();
+    _channelListMetric.requestLine = requestLine;
+    metricsLog("Channel list download started: request=\"" + requestLine + "\"");
+  }
+
+  void abortChannelJoinMetric(const String& reason) {
+    if (!_channelJoinMetric.active) return;
+    uint32_t elapsedMs = millis() - _channelJoinMetric.startedAtMs;
+    metricsLog("Channel join batch aborted: joined=" + String(_channelJoinMetric.joinedCount) +
+      "/" + String(_channelJoinMetric.requestedCount) +
+      ", duration=" + formatSeconds(elapsedMs) + " seconds, reason=" + reason);
+    _channelJoinMetric = ChannelJoinMetric();
+  }
+
+  void beginChannelJoinMetric(const std::vector<String>& channels, const String& source) {
+    std::vector<String> uniqueChannels;
+    for (const String& rawChannel : channels) {
+      String channel = trimCopy(rawChannel);
+      if (channel.isEmpty()) continue;
+      bool exists = false;
+      for (const String& existing : _channelJoinMetric.pendingChannels) {
+        if (equalsIgnoreCase(existing, channel)) {
+          exists = true;
+          break;
+        }
+      }
+      if (exists) continue;
+      for (const String& existing : uniqueChannels) {
+        if (equalsIgnoreCase(existing, channel)) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) uniqueChannels.push_back(channel);
+    }
+    if (uniqueChannels.empty()) return;
+    abortBncChannelAttachMetric("explicit join batch started");
+
+    bool wasActive = _channelJoinMetric.active;
+    if (!_channelJoinMetric.active) {
+      _channelJoinMetric.active = true;
+      _channelJoinMetric.startedAtMs = millis();
+      _channelJoinMetric.requestedCount = 0;
+      _channelJoinMetric.joinedCount = 0;
+      _channelJoinMetric.pendingChannels.clear();
+    }
+
+    for (const String& channel : uniqueChannels) {
+      _channelJoinMetric.pendingChannels.push_back(channel);
+      ++_channelJoinMetric.requestedCount;
+    }
+
+    metricsLog(String(wasActive ? "Channel join batch extended: requested=" : "Channel join batch started: requested=") +
+      String(_channelJoinMetric.requestedCount) +
+      ", source=" + source + ", channels=" + joinStrings(uniqueChannels, ","));
+  }
+
+  void noteJoinedChannel(const String& channel) {
+    if (!_channelJoinMetric.active) return;
+
+    for (size_t i = 0; i < _channelJoinMetric.pendingChannels.size(); ++i) {
+      if (!equalsIgnoreCase(_channelJoinMetric.pendingChannels[i], channel)) continue;
+
+      _channelJoinMetric.pendingChannels.erase(_channelJoinMetric.pendingChannels.begin() + i);
+      ++_channelJoinMetric.joinedCount;
+      metricsLog("Channel join acknowledged: channel=" + channel +
+        ", progress=" + String(_channelJoinMetric.joinedCount) + "/" + String(_channelJoinMetric.requestedCount));
+
+      if (_channelJoinMetric.pendingChannels.empty()) {
+        uint32_t elapsedMs = millis() - _channelJoinMetric.startedAtMs;
+        metricsLog("Channel join batch finished: joined=" + String(_channelJoinMetric.joinedCount) +
+          "/" + String(_channelJoinMetric.requestedCount) +
+          ", duration=" + formatSeconds(elapsedMs) + " seconds");
+        _channelJoinMetric = ChannelJoinMetric();
+      }
+      return;
+    }
+  }
+
+  std::vector<String> collectKnownBncChannels() const {
+    std::vector<String> channels;
+    auto addUnique = [&](const String& rawChannel) {
+      String channel = trimCopy(rawChannel);
+      if (channel.isEmpty() || !isChannelName(channel)) return;
+      for (const String& existing : channels) {
+        if (equalsIgnoreCase(existing, channel)) return;
+      }
+      channels.push_back(channel);
+    };
+
+    for (const String& channel : _cfg.autoJoin) addUnique(channel);
+    for (const Tab& tab : _tabs) {
+      if (tab.type == TabType::Channel) addUnique(tab.name);
+    }
+    return channels;
+  }
+
+  void beginBncChannelAttachMetric(const String& source) {
+    if (!_cfg.bncEnabled) return;
+    _bncChannelAttachArmed = true;
+    if (_bncChannelAttachMetric.active) return;
+
+    uint32_t now = millis();
+    std::vector<String> knownChannels = collectKnownBncChannels();
+    _bncChannelAttachMetric.active = true;
+    _bncChannelAttachMetric.startedAtMs = now;
+    _bncChannelAttachMetric.lastEventAtMs = now;
+    _bncChannelAttachMetric.expectedCount = knownChannels.size();
+    _bncChannelAttachMetric.source = source;
+    _bncChannelAttachMetric.channels.clear();
+
+    String message = "Bouncer channel attach batch started: source=" + source +
+      ", expected=" + String(_bncChannelAttachMetric.expectedCount);
+    metricsLog(message);
+  }
+
+  void abortBncChannelAttachMetric(const String& reason) {
+    if (!_bncChannelAttachMetric.active) return;
+    uint32_t elapsedMs = millis() - _bncChannelAttachMetric.startedAtMs;
+    String message = "Bouncer channel attach batch aborted: observed=" +
+      String(_bncChannelAttachMetric.channels.size());
+    if (_bncChannelAttachMetric.expectedCount > 0) {
+      message += "/" + String(_bncChannelAttachMetric.expectedCount);
+    }
+    message += ", duration=" + formatSeconds(elapsedMs) + " seconds, reason=" + reason;
+    metricsLog(message);
+    _bncChannelAttachMetric = BncChannelAttachMetric();
+    _bncChannelAttachArmed = false;
+  }
+
+  void noteBncObservedChannel(const String& channel, const String& eventType) {
+    if (!_cfg.bncEnabled || !_ircRegistered || channel.isEmpty() || !isChannelName(channel)) return;
+    if (_channelJoinMetric.active) return;
+    if (!_bncChannelAttachMetric.active && !_bncChannelAttachArmed) return;
+
+    uint32_t now = millis();
+    if (!_bncChannelAttachMetric.active) {
+      beginBncChannelAttachMetric(String("observed-") + lowerCopy(eventType));
+    }
+    _bncChannelAttachMetric.lastEventAtMs = now;
+
+    for (const String& existing : _bncChannelAttachMetric.channels) {
+      if (equalsIgnoreCase(existing, channel)) return;
+    }
+
+    _bncChannelAttachMetric.channels.push_back(channel);
+    String message = "Bouncer channel observed: channel=" + channel +
+      ", event=" + eventType + ", total=" + String(_bncChannelAttachMetric.channels.size());
+    if (_bncChannelAttachMetric.expectedCount > 0) {
+      message += "/" + String(_bncChannelAttachMetric.expectedCount);
+    }
+    metricsLog(message);
+  }
+
+  String observedChannelForMessage(const IrcMessage& msg) const {
+    if ((msg.command == "PRIVMSG" || msg.command == "NOTICE" || msg.command == "TAGMSG" ||
+         msg.command == "MODE" || msg.command == "TOPIC" || msg.command == "JOIN" ||
+         msg.command == "PART" || msg.command == "KICK") &&
+        !msg.params.empty()) {
+      return msg.params[0];
+    }
+    if ((msg.command == "332" || msg.command == "333" || msg.command == "366") && msg.params.size() > 1) {
+      return msg.params[1];
+    }
+    if (msg.command == "353" && msg.params.size() > 2) {
+      return msg.params[2];
+    }
+    return "";
+  }
+
+  void noteBncObservedChannelFromMessage(const IrcMessage& msg) {
+    String channel = observedChannelForMessage(msg);
+    if (channel.isEmpty()) return;
+    noteBncObservedChannel(channel, msg.command);
+  }
+
+  void serviceBncChannelAttachMetric() {
+    if (!_bncChannelAttachMetric.active) return;
+
+    uint32_t now = millis();
+    if (now - _bncChannelAttachMetric.lastEventAtMs < BNC_CHANNEL_ATTACH_IDLE_MS) return;
+
+    uint32_t elapsedMs = now - _bncChannelAttachMetric.startedAtMs;
+    String message = "Bouncer channel attach batch finished: observed=" +
+      String(_bncChannelAttachMetric.channels.size());
+    if (_bncChannelAttachMetric.expectedCount > 0) {
+      message += "/" + String(_bncChannelAttachMetric.expectedCount);
+    }
+    message += ", duration=" + formatSeconds(elapsedMs) + " seconds";
+    metricsLog(message);
+    _bncChannelAttachMetric = BncChannelAttachMetric();
+    _bncChannelAttachArmed = false;
+  }
+
+  void abortPingMetric(const String& reason) {
+    if (!_pingMetric.active) return;
+    uint32_t elapsedMs = millis() - _pingMetric.startedAtMs;
+    metricsLog("Server ping aborted: token=" + _pingMetric.token +
+      ", duration=" + formatSeconds(elapsedMs) + " seconds, reason=" + reason);
+    _pingMetric = PingMetric();
+  }
+
+  void beginPingMetric(const String& token) {
+    _pingMetric.active = true;
+    _pingMetric.startedAtMs = millis();
+    _pingMetric.token = token;
+    metricsLog("Server ping started: token=" + token + ", payload_bytes=" + String(token.length()));
+  }
+
+  void finishPingMetric(const String& token) {
+    if (!_pingMetric.active) return;
+    uint32_t elapsedMs = millis() - _pingMetric.startedAtMs;
+    metricsLog("Server ping finished: token=" + token +
+      ", duration=" + formatSeconds(elapsedMs) + " seconds");
+    _pingMetric = PingMetric();
+  }
+
   static uint16_t clampScreenTimeoutSeconds(long value) {
     return static_cast<uint16_t>(std::min<long>(3600, std::max<long>(0, value)));
   }
@@ -796,6 +1132,22 @@ class IrcClientApp {
   void recordUserActivity() {
     _lastUserActivityMs = millis();
     wakeDisplay();
+  }
+
+  bool shouldHandleDebouncedKey(bool pressed, uint32_t& lastAtMs, uint32_t debounceMs = KEYBOARD_ACTION_DEBOUNCE_MS) {
+    if (!pressed) return false;
+    uint32_t now = millis();
+    if (now - lastAtMs < debounceMs) return false;
+    lastAtMs = now;
+    return true;
+  }
+
+  bool shouldHandleDebouncedActionChar(char c, uint32_t debounceMs = KEYBOARD_ACTION_DEBOUNCE_MS) {
+    uint32_t now = millis();
+    if (_lastActionChar == c && now - _lastActionCharMs < debounceMs) return false;
+    _lastActionChar = c;
+    _lastActionCharMs = now;
+    return true;
   }
 
   void serviceDisplayTimeout() {
@@ -1283,6 +1635,75 @@ class IrcClientApp {
     if (!SD.exists(path)) SD.mkdir(path);
   }
 
+  void refreshLogPathCache() {
+    if (!_sdReady) return;
+
+    String root = _cfg.logRoot.isEmpty() ? "/IRC" : _cfg.logRoot;
+    String serverKey = safeFileName(_cfg.endpointHost.isEmpty() ? "unknown_server" : _cfg.endpointHost);
+    String date = currentDateStamp();
+    if (root == _cachedLogRoot && serverKey == _cachedLogServerKey && date == _cachedLogDate) return;
+
+    _cachedLogRoot = root;
+    _cachedLogServerKey = serverKey;
+    _cachedLogDate = date;
+    _cachedLogServerDir = root + "/" + serverKey;
+    _logPathCache.clear();
+    ensureDirRecursive(root);
+    ensureDirRecursive(_cachedLogServerDir);
+  }
+
+  String resolveLogPath(const String& tabName) {
+    if (!_sdReady) return "";
+    refreshLogPathCache();
+
+    String tabFolder = logTabFolderName(tabName);
+    for (const LogPathCacheEntry& entry : _logPathCache) {
+      if (entry.tabFolder == tabFolder) return entry.path;
+    }
+
+    String dir = _cachedLogServerDir + "/" + tabFolder;
+    ensureDirRecursive(dir);
+
+    LogPathCacheEntry entry;
+    entry.tabFolder = tabFolder;
+    entry.path = dir + "/" + _cachedLogDate + ".log";
+    _logPathCache.push_back(entry);
+    return entry.path;
+  }
+
+  void serviceSdLogFlush() {
+    if (!_sdReady) return;
+    if (!_cfg.channelLogEnabled) {
+      _pendingSdLogs.clear();
+      return;
+    }
+    if (_pendingSdLogs.empty()) return;
+
+    uint32_t startedAtUs = micros();
+    size_t flushedLines = 0;
+    while (!_pendingSdLogs.empty() && flushedLines < SD_LOG_FLUSH_MAX_LINES) {
+      if (static_cast<uint32_t>(micros() - startedAtUs) >= SD_LOG_FLUSH_TIME_BUDGET_US) break;
+
+      const String path = _pendingSdLogs.front().path;
+      File f = SD.open(path, FILE_APPEND);
+      if (!f) f = SD.open(path, FILE_WRITE);
+      if (!f) {
+        _pendingSdLogs.pop_front();
+        continue;
+      }
+
+      while (!_pendingSdLogs.empty() &&
+             _pendingSdLogs.front().path == path &&
+             flushedLines < SD_LOG_FLUSH_MAX_LINES) {
+        f.println(_pendingSdLogs.front().line);
+        _pendingSdLogs.pop_front();
+        ++flushedLines;
+        if (static_cast<uint32_t>(micros() - startedAtUs) >= SD_LOG_FLUSH_TIME_BUDGET_US) break;
+      }
+      f.close();
+    }
+  }
+
 
   void serviceButtons() {
     bool pressed = digitalRead(CONFIG_BUTTON_PIN) == LOW;
@@ -1352,7 +1773,10 @@ class IrcClientApp {
     _channelListOpen = false;
     _channelListLoading = false;
     _channelListTruncated = false;
+    _channelListFilterPrompt = false;
     _channelList.clear();
+    _channelListFilter = "";
+    _channelListFilterBuffer = "";
     _channelListSelected = 0;
     _channelListScroll = 0;
     _dirty = true;
@@ -1364,14 +1788,55 @@ class IrcClientApp {
       return;
     }
     _channelListOpen = true;
+    _channelListFilterPrompt = true;
+    _channelListFilter = "";
+    _channelListFilterBuffer = "";
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    _dirty = true;
+  }
+
+  void startChannelListSearch(const String& filter, bool refresh = true) {
+    if (!_transport.connected() || !_ircRegistered) {
+      logStatus("Channel list requires an IRC connection");
+      return;
+    }
+    _channelListOpen = true;
+    _channelListFilterPrompt = false;
+    _channelListFilter = trimCopy(filter);
+    _channelListFilterBuffer = _channelListFilter;
     _channelListSelected = 0;
     _channelListScroll = 0;
     _dirty = true;
     if (refresh || _channelList.empty()) requestChannelList();
   }
 
+  bool channelListMatchesFilter(const ChannelListEntry& entry) const {
+    if (_channelListFilter.isEmpty()) return true;
+    return lowerCopy(entry.name).indexOf(lowerCopy(_channelListFilter)) >= 0;
+  }
+
+  std::vector<int> filteredChannelListIndices() const {
+    std::vector<int> indices;
+    indices.reserve(_channelList.size());
+    for (size_t i = 0; i < _channelList.size(); ++i) {
+      if (channelListMatchesFilter(_channelList[i])) indices.push_back(static_cast<int>(i));
+    }
+    return indices;
+  }
+
+  void applyChannelListFilterAndRequest(bool refresh = true) {
+    _channelListFilter = trimCopy(_channelListFilterBuffer);
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    _channelListFilterPrompt = false;
+    if (refresh || _channelList.empty()) requestChannelList();
+    else _dirty = true;
+  }
+
   void closeChannelListPage() {
     _channelListOpen = false;
+    _channelListFilterPrompt = false;
     _dirty = true;
   }
 
@@ -1382,15 +1847,17 @@ class IrcClientApp {
     _channelList.clear();
     _channelListSelected = 0;
     _channelListScroll = 0;
+    beginChannelListMetric(_channelListFilter.isEmpty() ? "LIST" : "LIST (filter=\"" + _channelListFilter + "\")");
     sendRaw("LIST");
     _dirty = true;
   }
 
   void moveChannelListSelection(int delta) {
-    if (_channelList.empty()) return;
+    std::vector<int> visible = filteredChannelListIndices();
+    if (visible.empty()) return;
     _channelListSelected += delta;
-    if (_channelListSelected < 0) _channelListSelected = static_cast<int>(_channelList.size()) - 1;
-    if (_channelListSelected >= static_cast<int>(_channelList.size())) _channelListSelected = 0;
+    if (_channelListSelected < 0) _channelListSelected = static_cast<int>(visible.size()) - 1;
+    if (_channelListSelected >= static_cast<int>(visible.size())) _channelListSelected = 0;
 
     int visibleRows = bodyVisibleRows();
     if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
@@ -1429,17 +1896,23 @@ class IrcClientApp {
       if (a.users != b.users) return a.users > b.users;
       return lowerCopy(a.name) < lowerCopy(b.name);
     });
-    if (_channelListSelected >= static_cast<int>(_channelList.size())) _channelListSelected = std::max(0, static_cast<int>(_channelList.size()) - 1);
+    int filteredCount = static_cast<int>(filteredChannelListIndices().size());
+    if (_channelListSelected >= filteredCount) _channelListSelected = std::max(0, filteredCount - 1);
     String msg = "Channel list ready: " + String(_channelList.size()) + " entries";
+    if (!_channelListFilter.isEmpty()) msg += ", filter matches " + String(filteredCount);
     if (_channelListTruncated) msg += " (truncated)";
     logStatus(msg);
+    finishChannelListMetric();
     _dirty = true;
   }
 
   void joinSelectedChannelFromList() {
-    if (_channelList.empty()) return;
-    const ChannelListEntry& entry = _channelList[_channelListSelected];
+    std::vector<int> visible = filteredChannelListIndices();
+    if (visible.empty()) return;
+    if (_channelListSelected < 0 || _channelListSelected >= static_cast<int>(visible.size())) return;
+    const ChannelListEntry& entry = _channelList[visible[_channelListSelected]];
     if (entry.name.isEmpty()) return;
+    beginChannelJoinMetric({entry.name}, "channel-list");
     sendRaw("JOIN " + entry.name);
     Tab& tab = getOrCreateTab(entry.name, TabType::Channel);
     _activeTab = static_cast<int>(&tab - &_tabs[0]);
@@ -1521,6 +1994,8 @@ class IrcClientApp {
       case CFG_PERSIST_TABS: return "persist_tabs";
       case CFG_SHOW_CONTROL_GLYPHS: return "ctrl_glyphs";
       case CFG_TEXT_OVERFLOW: return "text_overflow";
+      case CFG_SERIAL_LOG: return "metrics_log_enabled";
+      case CFG_CHANNEL_LOG: return "channel_log_enabled";
       case CFG_SCREEN_TIMEOUT: return "screen_timeout_sec";
       case CFG_SCREEN_BRIGHTNESS: return "screen_brightness";
       case CFG_LOG_ROOT: return "log_root";
@@ -1564,6 +2039,8 @@ class IrcClientApp {
       case CFG_PERSIST_TABS: return boolToOnOff(_editCfg.persistTabs);
       case CFG_SHOW_CONTROL_GLYPHS: return boolToOnOff(_editCfg.showControlGlyphs);
       case CFG_TEXT_OVERFLOW: return textOverflowModeToString(_editCfg.textOverflowMode);
+      case CFG_SERIAL_LOG: return boolToOnOff(_editCfg.serialLogEnabled);
+      case CFG_CHANNEL_LOG: return boolToOnOff(_editCfg.channelLogEnabled);
       case CFG_SCREEN_TIMEOUT: return String(_editCfg.screenTimeoutSec);
       case CFG_SCREEN_BRIGHTNESS: return String(_editCfg.screenBrightness);
       case CFG_LOG_ROOT: return _editCfg.logRoot;
@@ -1603,6 +2080,7 @@ class IrcClientApp {
       case CFG_SASL_USER: _editCfg.saslUser = value; break;
       case CFG_SASL_PASS: _editCfg.saslPass = value; break;
       case CFG_TEXT_OVERFLOW: _editCfg.textOverflowMode = parseTextOverflowMode(value); break;
+      case CFG_CHANNEL_LOG: _editCfg.channelLogEnabled = strToBool(value); break;
       case CFG_SCREEN_TIMEOUT: _editCfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt()); break;
       case CFG_SCREEN_BRIGHTNESS: _editCfg.screenBrightness = clampScreenBrightnessLevel(value.toInt()); break;
       case CFG_LOG_ROOT: _editCfg.logRoot = value; break;
@@ -1659,11 +2137,13 @@ class IrcClientApp {
     f.println("nick_pane_enabled=" + String(cfg.nickPaneEnabled ? "true" : "false"));
     f.println("reconnect_initial_ms=" + String(cfg.reconnectInitialMs));
     f.println("reconnect_max_ms=" + String(cfg.reconnectMaxMs));
+    f.println("channel_log_enabled=" + String(cfg.channelLogEnabled ? "true" : "false"));
     f.println("log_root=" + cfg.logRoot);
     f.println("color_mode=" + colorModeToString(cfg.colorMode));
     f.println("show_control_glyphs=" + String(cfg.showControlGlyphs ? "true" : "false"));
     f.println("persist_tabs=" + String(cfg.persistTabs ? "true" : "false"));
     f.println("text_overflow=" + textOverflowModeToString(cfg.textOverflowMode));
+    f.println("metrics_log_enabled=" + String(cfg.serialLogEnabled ? "true" : "false"));
     f.println("screen_timeout_sec=" + String(cfg.screenTimeoutSec));
     f.println("screen_brightness=" + String(cfg.screenBrightness));
     f.close();
@@ -1716,6 +2196,12 @@ class IrcClientApp {
           ? TextOverflowMode::Wrap
           : TextOverflowMode::Marquee;
         break;
+      case CFG_SERIAL_LOG:
+        _editCfg.serialLogEnabled = !_editCfg.serialLogEnabled;
+        break;
+      case CFG_CHANNEL_LOG:
+        _editCfg.channelLogEnabled = !_editCfg.channelLogEnabled;
+        break;
       case CFG_SAVE_AND_RECONNECT:
         if (_editCfg.reconnectInitialMs == 0) _editCfg.reconnectInitialMs = 3000;
         if (_editCfg.reconnectMaxMs < _editCfg.reconnectInitialMs) _editCfg.reconnectMaxMs = _editCfg.reconnectInitialMs;
@@ -1764,15 +2250,15 @@ class IrcClientApp {
           _configEditBuffer += c;
         }
       }
-      if (ks.del && !_configEditBuffer.isEmpty()) {
+      if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs) && !_configEditBuffer.isEmpty()) {
         _configEditBuffer.remove(_configEditBuffer.length() - 1);
       }
-      if (ks.enter) {
+      if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
         setConfigFieldValue(_configSelected, _configEditBuffer);
         _configEditing = false;
         _configEditBuffer = "";
       }
-      if (ks.tab) {
+      if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
         setConfigFieldValue(_configSelected, _configEditBuffer);
         _configEditing = false;
         _configEditBuffer = "";
@@ -1782,11 +2268,12 @@ class IrcClientApp {
       return;
     }
 
-    if (ks.tab) moveConfigSelection(1);
-    if (ks.del) moveConfigSelection(-1);
-    if (ks.enter) activateConfigField();
+    if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) moveConfigSelection(1);
+    if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs)) moveConfigSelection(-1);
+    if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) activateConfigField();
 
     for (char c : ks.word) {
+      if ((c == '.' || c == ';' || c == ' ') && !shouldHandleDebouncedActionChar(c)) continue;
       if (c == '.') moveConfigSelection(1);
       else if (c == ';') moveConfigSelection(-1);
       else if (c == ' ') activateConfigField();
@@ -1855,11 +2342,15 @@ class IrcClientApp {
       else if (key == "nick_pane_enabled") _cfg.nickPaneEnabled = strToBool(value);
       else if (key == "reconnect_initial_ms") _cfg.reconnectInitialMs = static_cast<uint32_t>(value.toInt());
       else if (key == "reconnect_max_ms") _cfg.reconnectMaxMs = static_cast<uint32_t>(value.toInt());
+      else if (key == "channel_log_enabled" || key == "chat_log_enabled") _cfg.channelLogEnabled = strToBool(value);
       else if (key == "log_root") _cfg.logRoot = value;
       else if (key == "color_mode") _cfg.colorMode = parseColorMode(value);
       else if (key == "show_control_glyphs") _cfg.showControlGlyphs = strToBool(value);
       else if (key == "persist_tabs") _cfg.persistTabs = strToBool(value);
       else if (key == "text_overflow" || key == "chat_text_mode") _cfg.textOverflowMode = parseTextOverflowMode(value);
+      else if (key == "metrics_log_enabled" || key == "serial_log_enabled" || key == "serial_metrics_enabled") {
+        _cfg.serialLogEnabled = strToBool(value);
+      }
       else if (key == "screen_timeout_sec") _cfg.screenTimeoutSec = clampScreenTimeoutSeconds(value.toInt());
       else if (key == "screen_brightness") _cfg.screenBrightness = clampScreenBrightnessLevel(value.toInt());
     }
@@ -1990,6 +2481,10 @@ class IrcClientApp {
 
   void scheduleReconnect(const String& reason) {
     if (!reason.isEmpty()) logStatus(reason);
+    abortChannelListMetric(reason.isEmpty() ? String("reconnect") : reason);
+    abortChannelJoinMetric(reason.isEmpty() ? String("reconnect") : reason);
+    abortBncChannelAttachMetric(reason.isEmpty() ? String("reconnect") : reason);
+    abortPingMetric(reason.isEmpty() ? String("reconnect") : reason);
     _transport.close();
     _channelListLoading = false;
     _channelList.clear();
@@ -2038,7 +2533,15 @@ class IrcClientApp {
 
       String error;
       logStatus("Connecting IRC...");
+      uint32_t connectStartedAtMs = millis();
+      metricsLog("IRC session configuration: bouncer=" +
+        (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
+      metricsLog("IRC transport connection started: host=" + _cfg.endpointHost +
+        ", port=" + String(_cfg.endpointPort) +
+        ", tls=" + String(_cfg.useTLS ? "true" : "false"));
       if (_transport.connect(_cfg, error)) {
+        metricsLog("IRC transport connection finished: host=" + _cfg.endpointHost +
+          ", duration=" + formatSeconds(millis() - connectStartedAtMs) + " seconds");
         _previousTransportState = true;
         _lastRxMs = millis();
         _awaitingPong = false;
@@ -2060,20 +2563,28 @@ class IrcClientApp {
         performRegistration();
         logStatus("IRC transport connected");
       } else {
+        metricsLog("IRC transport connection failed: host=" + _cfg.endpointHost +
+          ", duration=" + formatSeconds(millis() - connectStartedAtMs) + " seconds, error=" + error);
         scheduleReconnect("Connect failed: " + error);
       }
       return;
     }
 
-    while (_transport.available()) {
+    size_t rxBytesProcessed = 0;
+    size_t rxLinesProcessed = 0;
+    while (_transport.available() &&
+           rxBytesProcessed < IRC_RX_BYTE_BUDGET_PER_LOOP &&
+           rxLinesProcessed < IRC_RX_LINE_BUDGET_PER_LOOP) {
       int ch = _transport.read();
       if (ch < 0) break;
+      ++rxBytesProcessed;
       char c = static_cast<char>(ch);
       if (c == '\r') continue;
       if (c == '\n') {
         if (!_rxBuffer.isEmpty()) {
           handleRawLine(_rxBuffer);
           _rxBuffer = "";
+          ++rxLinesProcessed;
         }
       } else {
         _rxBuffer += c;
@@ -2083,6 +2594,7 @@ class IrcClientApp {
 
     if (!_awaitingPong && millis() - _lastRxMs > PING_INTERVAL_MS) {
       _lastPingToken = String(millis());
+      beginPingMetric(_lastPingToken);
       sendRawNoEcho("PING :" + _lastPingToken);
       _lastPingMs = millis();
       _awaitingPong = true;
@@ -2365,6 +2877,7 @@ class IrcClientApp {
 
     if (msg.command == "PONG") {
       _awaitingPong = false;
+      finishPingMetric(msg.params.empty() ? _lastPingToken : msg.params.back());
       appendLine(statusTab(), "*** Pong " + (msg.params.empty() ? "" : msg.params.back()), messageStampShort(msg), messageStampLog(msg));
       return;
     }
@@ -2399,6 +2912,7 @@ class IrcClientApp {
       _selfNick = _cfg.nick;
       resetReconnectBackoff();
       appendLine(statusTab(), "*** Registered on IRC", messageStampShort(msg), messageStampLog(msg));
+      beginBncChannelAttachMetric("post-registration");
       if (capEnabled("soju.im/bouncer-networks") && !capEnabled("soju.im/bouncer-networks-notify")) {
         sendRawNoEcho("BOUNCER LISTNETWORKS");
       }
@@ -2410,6 +2924,8 @@ class IrcClientApp {
       handleISupport(msg);
       return;
     }
+
+    noteBncObservedChannelFromMessage(msg);
 
     if (msg.command == "433") {
       _cfg.nick += "_";
@@ -2471,6 +2987,10 @@ class IrcClientApp {
       handlePrivmsg(msg, true);
       return;
     }
+    if (msg.command == "TAGMSG") {
+      handleTagmsg(msg);
+      return;
+    }
     if (msg.command == "TOPIC") {
       handleTopicChange(msg);
       return;
@@ -2485,7 +3005,13 @@ class IrcClientApp {
     }
     if (msg.command == "366") {
       Tab* tab = msg.params.size() > 1 ? findTab(msg.params[1]) : nullptr;
-      if (tab) appendLine(*tab, "*** End of NAMES", messageStampShort(msg), messageStampLog(msg));
+      if (tab) {
+        if (tab->namesBatchActive) {
+          if (tab->usersDirty) sortUsers(*tab);
+          tab->namesBatchActive = false;
+        }
+        appendLine(*tab, "*** End of NAMES", messageStampShort(msg), messageStampLog(msg));
+      }
       return;
     }
     if (msg.command == "MODE") {
@@ -2551,6 +3077,10 @@ class IrcClientApp {
     SojuNetwork& network = ensureSojuNetwork(list, netId);
     applySojuNetworkAttributes(network, attrs);
     if (!inBatch) appendLine(statusTab(), "*** soju network: " + summarizeSojuNetwork(network));
+    if (!inBatch && _cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju &&
+        equalsIgnoreCase(network.state, "connected")) {
+      beginBncChannelAttachMetric("soju-network-connected");
+    }
   }
 
   void handleBouncer(const IrcMessage& msg) {
@@ -2615,6 +3145,7 @@ class IrcClientApp {
         if (!exists) joined.push_back(_tabs[i].name);
       }
     }
+    beginChannelJoinMetric(joined, "autojoin");
     for (const String& c : joined) {
       sendRaw("JOIN " + c);
     }
@@ -2963,21 +3494,38 @@ class IrcClientApp {
     return false;
   }
 
+  static int compareNickIgnoreCase(const String& a, const String& b) {
+    size_t count = std::min(a.length(), b.length());
+    for (size_t i = 0; i < count; ++i) {
+      unsigned char ca = static_cast<unsigned char>(a[i]);
+      unsigned char cb = static_cast<unsigned char>(b[i]);
+      int diff = tolower(ca) - tolower(cb);
+      if (diff != 0) return diff;
+    }
+    if (a.length() < b.length()) return -1;
+    if (a.length() > b.length()) return 1;
+    return 0;
+  }
+
   void sortUsers(Tab& tab) {
     std::sort(tab.users.begin(), tab.users.end(), [&](const UserEntry& a, const UserEntry& b) {
       int wa = prefixWeight(a.prefix);
       int wb = prefixWeight(b.prefix);
       if (wa != wb) return wa < wb;
-      return lowerCopy(a.nick) < lowerCopy(b.nick);
+      return compareNickIgnoreCase(a.nick, b.nick) < 0;
     });
+    tab.usersDirty = false;
   }
 
-  void addOrUpdateUser(Tab& tab, const String& nick, char prefix = 0) {
+  void addOrUpdateUser(Tab& tab, const String& nick, char prefix = 0, bool sortNow = true) {
     if (nick.isEmpty()) return;
     for (UserEntry& entry : tab.users) {
       if (equalsIgnoreCase(entry.nick, nick)) {
-        if (prefix && prefixWeight(prefix) < prefixWeight(entry.prefix)) entry.prefix = prefix;
-        sortUsers(tab);
+        if (prefix && prefixWeight(prefix) < prefixWeight(entry.prefix)) {
+          entry.prefix = prefix;
+          if (sortNow) sortUsers(tab);
+          else tab.usersDirty = true;
+        }
         return;
       }
     }
@@ -2986,7 +3534,8 @@ class IrcClientApp {
     entry.nick = nick;
     entry.prefix = prefix;
     tab.users.push_back(entry);
-    sortUsers(tab);
+    if (sortNow) sortUsers(tab);
+    else tab.usersDirty = true;
   }
 
   void removeUser(Tab& tab, const String& nick) {
@@ -3000,6 +3549,8 @@ class IrcClientApp {
 
   void clearUsers(Tab& tab) {
     tab.users.clear();
+    tab.usersDirty = false;
+    tab.namesBatchActive = false;
   }
 
   void appendLine(Tab& tab, const String& rawText, const String& stampShort = "", const String& stampLog = "", bool highlight = false, bool own = false, bool notice = false) {
@@ -3037,18 +3588,15 @@ class IrcClientApp {
   }
 
   void logToSD(const String& tabName, const String& line) {
-    if (!_sdReady) return;
-    String root = _cfg.logRoot.isEmpty() ? "/IRC" : _cfg.logRoot;
-    ensureDirRecursive(root);
-    String serverDir = root + "/" + safeFileName(_cfg.endpointHost.isEmpty() ? "unknown_server" : _cfg.endpointHost);
-    ensureDirRecursive(serverDir);
-    String dir = serverDir + "/" + logTabFolderName(tabName);
-    ensureDirRecursive(dir);
-    String path = dir + "/" + currentDateStamp() + ".log";
-    File f = SD.open(path, FILE_APPEND);
-    if (!f) return;
-    f.println(line);
-    f.close();
+    if (!_sdReady || !_cfg.channelLogEnabled) return;
+    PendingSdLogLine entry;
+    entry.path = resolveLogPath(tabName);
+    if (entry.path.isEmpty()) return;
+    entry.line = line;
+    if (_pendingSdLogs.size() >= MAX_PENDING_SD_LOG_LINES) {
+      _pendingSdLogs.pop_front();
+    }
+    _pendingSdLogs.push_back(entry);
   }
 
   void handleJoin(const IrcMessage& msg) {
@@ -3058,6 +3606,7 @@ class IrcClientApp {
 
     Tab& tab = getOrCreateTab(channel, TabType::Channel);
     if (equalsIgnoreCase(nick, _selfNick)) {
+      noteJoinedChannel(channel);
       appendLine(tab, "*** Joined " + channel, messageStampShort(msg), messageStampLog(msg));
       tab.unread = false;
       tab.mention = false;
@@ -3164,6 +3713,12 @@ class IrcClientApp {
     appendLine(*tab, line, messageStampShort(msg), messageStampLog(msg), highlight, false, notice);
   }
 
+  void handleTagmsg(const IrcMessage& msg) {
+    (void)msg;
+    // TAGMSG is frequently used for ephemeral typing/activity tags on soju.
+    // Ignore it in the UI to avoid flooding the status tab with raw lines.
+  }
+
   void handleTopicReply(const IrcMessage& msg) {
     if (msg.command == "332" && msg.params.size() >= 3) {
       Tab& tab = getOrCreateTab(msg.params[1], TabType::Channel);
@@ -3185,6 +3740,10 @@ class IrcClientApp {
   void handleNames(const IrcMessage& msg) {
     if (msg.params.size() < 4) return;
     Tab& tab = getOrCreateTab(msg.params[2], TabType::Channel);
+    if (!tab.namesBatchActive) {
+      clearUsers(tab);
+      tab.namesBatchActive = true;
+    }
 
     int start = 0;
     String names = msg.params[3];
@@ -3194,7 +3753,7 @@ class IrcClientApp {
       nick.trim();
       if (!nick.isEmpty()) {
         char prefix = extractPrefixFromNick(nick);
-        addOrUpdateUser(tab, nick, prefix);
+        addOrUpdateUser(tab, nick, prefix, false);
       }
       if (sp < 0) break;
       start = sp + 1;
@@ -3304,10 +3863,11 @@ class IrcClientApp {
     auto ks = M5Cardputer.Keyboard.keysState();
 
     for (char c : ks.word) {
-      if (ks.fn && handleFnScrollShortcut(c)) {
+      if (ks.fn && shouldHandleDebouncedActionChar(c) && handleFnScrollShortcut(c)) {
         continue;
       }
       if (c == '`') {
+        if (!shouldHandleDebouncedActionChar(c)) continue;
         openChannelListPage(true);
         continue;
       }
@@ -3316,15 +3876,15 @@ class IrcClientApp {
       }
     }
 
-    if (ks.del && !_input.isEmpty()) {
+    if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs) && !_input.isEmpty()) {
       _input.remove(_input.length() - 1);
     }
 
-    if (ks.enter) {
+    if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
       submitInput();
     }
 
-    if (ks.tab) {
+    if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
       cycleTab(1);
     }
 
@@ -3338,19 +3898,45 @@ class IrcClientApp {
 
     auto ks = M5Cardputer.Keyboard.keysState();
 
-    if (ks.enter) {
+    if (_channelListFilterPrompt) {
+      for (char c : ks.word) {
+        if (c == '`') {
+          if (!shouldHandleDebouncedActionChar(c)) continue;
+          closeChannelListPage();
+          return;
+        }
+        if (c >= 32 && c != '\t' && _channelListFilterBuffer.length() < MAX_INPUT_CHARS) {
+          _channelListFilterBuffer += c;
+        }
+      }
+
+      if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs) && !_channelListFilterBuffer.isEmpty()) {
+        _channelListFilterBuffer.remove(_channelListFilterBuffer.length() - 1);
+      }
+
+      if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
+        applyChannelListFilterAndRequest(true);
+      }
+
+      _dirty = true;
+      return;
+    }
+
+    if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
       joinSelectedChannelFromList();
       return;
     }
 
-    if (ks.tab) moveChannelListSelection(1);
-    if (ks.del) moveChannelListSelection(-1);
+    if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) moveChannelListSelection(1);
+    if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs)) moveChannelListSelection(-1);
 
     for (char c : ks.word) {
       if (c == '`') {
+        if (!shouldHandleDebouncedActionChar(c)) continue;
         closeChannelListPage();
         return;
       }
+      if ((c == '.' || c == ';') && !shouldHandleDebouncedActionChar(c)) continue;
       if (c == '.') moveChannelListSelection(1);
       else if (c == ';') moveChannelListSelection(-1);
     }
@@ -3538,6 +4124,10 @@ class IrcClientApp {
 
     if (cmd == "join") {
       if (!args.isEmpty()) {
+        String joinTargets = args;
+        int keySep = joinTargets.indexOf(' ');
+        if (keySep >= 0) joinTargets = joinTargets.substring(0, keySep);
+        beginChannelJoinMetric(splitCsv(joinTargets), "manual");
         sendRaw("JOIN " + args);
         for (const String& ch : splitCsv(args)) getOrCreateTab(ch, TabType::Channel);
         markStateDirty();
@@ -3731,7 +4321,7 @@ class IrcClientApp {
 
     if (cmd == "list") {
       if (args.isEmpty()) openChannelListPage(true);
-      else sendRaw("LIST " + args);
+      else startChannelListSearch(args, true);
       return;
     }
 
@@ -3904,7 +4494,8 @@ class IrcClientApp {
     gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
     gfx.setTextColor(UI_FG, UI_HEADER);
     gfx.setCursor(2, 3);
-    gfx.print(_channelListLoading ? "CHANNELS LOAD" : "CHANNEL LIST");
+    if (_channelListFilterPrompt) gfx.print("CHANNEL FILTER");
+    else gfx.print(_channelListLoading ? "CHANNELS LOAD" : "CHANNEL LIST");
 
     String rhs = "` close";
     gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
@@ -3913,36 +4504,56 @@ class IrcClientApp {
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
-    int visibleRows = bodyVisibleRows();
-    if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
-    if (_channelListSelected >= _channelListScroll + visibleRows) {
-      _channelListScroll = _channelListSelected - visibleRows + 1;
-    }
-    if (_channelListScroll < 0) _channelListScroll = 0;
-
-    if (_channelList.empty() && _channelListLoading) {
+    if (_channelListFilterPrompt) {
       gfx.setTextColor(UI_DIM, UI_BG);
       gfx.setCursor(8, BODY_Y + 10);
-      gfx.print("Loading channel list...");
-    } else if (_channelList.empty()) {
-      gfx.setTextColor(UI_DIM, UI_BG);
-      gfx.setCursor(8, BODY_Y + 10);
-      gfx.print("No channels available");
+      gfx.print("Type a search filter");
+      gfx.setCursor(8, BODY_Y + 22);
+      gfx.print("Enter = full list if blank");
+      gfx.setCursor(8, BODY_Y + 34);
+      gfx.print("Matching is substring-based");
     } else {
-      int y = BODY_Y + 1;
-      for (int idx = _channelListScroll; idx < static_cast<int>(_channelList.size()) && idx < _channelListScroll + visibleRows; ++idx) {
-        bool selected = idx == _channelListSelected;
-        uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
-        gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
-        gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
-        gfx.setCursor(2, y);
-        gfx.print(selected ? ">" : " ");
+      std::vector<int> visible = filteredChannelListIndices();
+      int visibleRows = bodyVisibleRows();
+      if (_channelListSelected < _channelListScroll) _channelListScroll = _channelListSelected;
+      if (_channelListSelected >= _channelListScroll + visibleRows) {
+        _channelListScroll = _channelListSelected - visibleRows + 1;
+      }
+      if (_channelListScroll < 0) _channelListScroll = 0;
 
-        String row = _channelList[idx].name + " [" + String(_channelList[idx].users) + "]";
-        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
-        gfx.setCursor(10, y);
-        gfx.print(ellipsize(row, 37));
-        y += ROW_H;
+      if (_channelListSelected >= static_cast<int>(visible.size())) {
+        _channelListSelected = std::max(0, static_cast<int>(visible.size()) - 1);
+      }
+
+      if (_channelList.empty() && _channelListLoading) {
+        gfx.setTextColor(UI_DIM, UI_BG);
+        gfx.setCursor(8, BODY_Y + 10);
+        gfx.print("Loading channel list...");
+      } else if (_channelList.empty()) {
+        gfx.setTextColor(UI_DIM, UI_BG);
+        gfx.setCursor(8, BODY_Y + 10);
+        gfx.print("No channels available");
+      } else if (visible.empty()) {
+        gfx.setTextColor(UI_DIM, UI_BG);
+        gfx.setCursor(8, BODY_Y + 10);
+        gfx.print("No channels match filter");
+      } else {
+        int y = BODY_Y + 1;
+        for (int idx = _channelListScroll; idx < static_cast<int>(visible.size()) && idx < _channelListScroll + visibleRows; ++idx) {
+          const ChannelListEntry& entry = _channelList[visible[idx]];
+          bool selected = idx == _channelListSelected;
+          uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
+          gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
+          gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
+          gfx.setCursor(2, y);
+          gfx.print(selected ? ">" : " ");
+
+          String row = entry.name + " [" + String(entry.users) + "]";
+          gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
+          gfx.setCursor(10, y);
+          gfx.print(ellipsize(row, 37));
+          y += ROW_H;
+        }
       }
     }
 
@@ -3951,12 +4562,30 @@ class IrcClientApp {
     gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
     gfx.setTextColor(UI_FG, UI_INPUT);
 
+    if (_channelListFilterPrompt) {
+      gfx.setCursor(2, inputY + 4);
+      gfx.print("Filter:");
+
+      int charsPerRow = std::max(1, (SCREEN_W - 4) / CHAR_W);
+      String src = _channelListFilterBuffer;
+      if (static_cast<int>(src.length()) > charsPerRow) src = src.substring(src.length() - charsPerRow);
+      gfx.setCursor(2, inputY + 13);
+      gfx.print(ellipsize(src, charsPerRow));
+      return;
+    }
+
     String info;
     if (_channelList.empty()) {
       info = _channelListLoading ? "Waiting for LIST reply" : "Press ` to close";
     } else {
-      const ChannelListEntry& entry = _channelList[_channelListSelected];
-      info = entry.topic.isEmpty() ? "No topic" : entry.topic;
+      std::vector<int> visible = filteredChannelListIndices();
+      if (visible.empty()) {
+        info = _channelListLoading ? "Filtering incoming channel list" : "No filter matches";
+      } else {
+        const ChannelListEntry& entry = _channelList[visible[_channelListSelected]];
+        info = entry.topic.isEmpty() ? "No topic" : entry.topic;
+      }
+      if (!_channelListFilter.isEmpty()) info = "filter=" + _channelListFilter + " | " + info;
       if (_channelListTruncated) info = "(truncated) " + info;
     }
     gfx.setCursor(2, inputY + 4);
